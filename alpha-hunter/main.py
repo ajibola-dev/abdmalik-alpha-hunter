@@ -83,14 +83,14 @@ def main():
     logger.info("🎯 Alpha Hunter starting in continuous mode...")
     from modules.pipeline import research_tweet_url
     from modules.telegram_bot import start_polling
-    from modules.scheduler import run_scheduler
+    from modules.scheduler import start_all_schedulers
 
     # Start Telegram polling in background
     start_polling(pipeline_callback=lambda tweet_url, chat_id:
                   research_tweet_url(tweet_url, chat_id))
 
-    # Run scheduler (blocking)
-    run_scheduler()
+    # Run all schedulers (main scan + discovery)
+    start_all_schedulers()
 
 
 if __name__ == "__main__":
