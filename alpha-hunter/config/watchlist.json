@@ -1,0 +1,20 @@
+{
+  "_comment": "Your curated X alpha caller watchlist. Add/remove accounts here.",
+  "accounts": [
+    {
+      "handle": "Zun2025",
+      "name": "Zun",
+      "tier": 1,
+      "notes": "High conviction, depth over breadth, infrastructure focus",
+      "trusted": true
+    },
+    {
+      "handle": "MztaCat",
+      "name": "MztaCat", 
+      "tier": 2,
+      "notes": "Large following — projects may be saturated by post time",
+      "trusted": true
+    }
+  ],
+  "auto_discover": true
+}
