@@ -46,6 +46,11 @@ def process_tweet(tweet: dict, caller_tier: int = 2) -> list[dict]:
     handle = tweet.get("handle", "unknown")
     tweet_url = tweet.get("url", "")
 
+    # Dedup — skip tweets already processed this session
+    from modules.project_extractor import is_seen_tweet
+    if is_seen_tweet(tweet_url, text):
+        return []
+
     # Quality check
     tweet_quality = score_tweet_quality(text, handle, caller_tier)
     if tweet_quality < 0.2:
@@ -75,14 +80,23 @@ def process_tweet(tweet: dict, caller_tier: int = 2) -> list[dict]:
             # Score
             score_result = score_project(project, caller_tier=caller_tier)
 
-            # Save to DB
+            # Save to DB — store novel_tech as comma-separated string
+            project_extras = {k: v for k, v in project.items()
+                   if k not in ("name", "mentioned_by", "tweet_url",
+                                "tweet_text", "research_notes",
+                                "novel_tech", "source_record")}
+            # Store novel_tech in description field for persistence
+            if project.get("novel_tech"):
+                project_extras["description"] = (
+                    project_extras.get("description", "") +
+                    " [tech:" + ",".join(project["novel_tech"]) + "]"
+                )
             project_id = db.upsert_project(
                 name=name,
                 mentioned_by=handle,
                 tweet_url=tweet_url,
                 tweet_text=text[:500],
-                **{k: v for k, v in project.items()
-                   if k not in ("name", "mentioned_by", "tweet_url", "tweet_text", "research_notes", "novel_tech", "source_record")}
+                **project_extras
             )
             db.save_score(
                 project_id=project_id,
