@@ -16,6 +16,42 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 _SESSION = requests.Session()
+
+# ── Nitter instance health check ──────────────────────────────────────────
+_healthy_instances: list[str] = []
+_last_health_check: float = 0
+
+
+def _get_healthy_instance() -> str | None:
+    """Returns a working Nitter instance, checking health every 30 mins."""
+    global _healthy_instances, _last_health_check
+    import time as _time
+
+    if _healthy_instances and (_time.time() - _last_health_check) < 1800:
+        import random
+        return random.choice(_healthy_instances)
+
+    # Re-check all instances
+    _healthy_instances = []
+    for instance in settings.NITTER_INSTANCES:
+        try:
+            r = _SESSION.get(f"{instance}/twitter", timeout=8)
+            if r.status_code == 200:
+                _healthy_instances.append(instance)
+                logger.debug("Nitter healthy: %s", instance)
+        except Exception:
+            logger.debug("Nitter down: %s", instance)
+
+    _last_health_check = _time.time()
+
+    if not _healthy_instances:
+        logger.warning("All Nitter instances are down!")
+        return None
+
+    logger.info("Healthy Nitter instances: %d/%d",
+                len(_healthy_instances), len(settings.NITTER_INSTANCES))
+    import random
+    return random.choice(_healthy_instances)
 _SESSION.headers.update(settings.REQUEST_HEADERS)
 
 
