@@ -87,7 +87,7 @@ def _cmd_start(chat_id: str):
         "/tasks — Your pending grind tasks\n"
         "/done &lt;id&gt; — Mark task complete\n"
         "/status — Agent health\n"
-        "/research &lt;tweet_url&gt; — Research a tweet\n\n"
+        "/research &lt;tweet_url&gt; — Research a tweet\n"        "/suggestions — Pending account discoveries\n"        "/approve &lt;handle&gt; — Add discovered account\n"        "/reject &lt;handle&gt; — Dismiss suggestion\n\n"
         "<i>Or just forward any tweet URL and I'll research it instantly.</i>",
         chat_id=chat_id
     )
@@ -271,6 +271,12 @@ def _handle_message(text: str, chat_id: str, pipeline_callback=None):
             pipeline_callback(tweet_url=urls[0], chat_id=chat_id)
         else:
             send_message("Usage: /research https://twitter.com/...", chat_id=chat_id)
+    elif lower.startswith("/approve "):
+        _cmd_approve(chat_id, text[9:].strip())
+    elif lower.startswith("/reject "):
+        _cmd_reject(chat_id, text[8:].strip())
+    elif lower.startswith("/suggestions"):
+        _cmd_suggestions(chat_id)
     else:
         send_message(
             "Unknown command. Type /start to see all commands.",
@@ -302,3 +308,54 @@ def start_polling(pipeline_callback=None):
     thread = threading.Thread(target=_poll, daemon=True)
     thread.start()
     return thread
+
+
+def _cmd_approve(chat_id: str, handle: str):
+    from modules.account_discovery import approve_suggestion
+    if not handle:
+        send_message("Usage: /approve <handle>", chat_id=chat_id)
+        return
+    success = approve_suggestion(handle)
+    if success:
+        send_message(
+            f"✅ <b>@{handle}</b> added to watchlist!\n"
+            f"They'll be monitored from the next scan cycle.",
+            chat_id=chat_id
+        )
+    else:
+        send_message(f"❌ Could not add @{handle}. May already be in watchlist.", chat_id=chat_id)
+
+
+def _cmd_reject(chat_id: str, handle: str):
+    from modules.account_discovery import reject_suggestion
+    if not handle:
+        send_message("Usage: /reject <handle>", chat_id=chat_id)
+        return
+    reject_suggestion(handle)
+    send_message(f"❌ @{handle} rejected and won't be suggested again.", chat_id=chat_id)
+
+
+def _cmd_suggestions(chat_id: str):
+    """Show all pending account suggestions."""
+    with __import__('modules.database', fromlist=['_conn']).database._conn() as con:
+        con.row_factory = __import__('sqlite3').Row
+        try:
+            rows = con.execute("""
+                SELECT * FROM account_suggestions
+                WHERE status='pending'
+                ORDER BY score DESC
+            """).fetchall()
+        except Exception:
+            send_message("No suggestions yet. Run a discovery cycle first.", chat_id=chat_id)
+            return
+
+    if not rows:
+        send_message("No pending suggestions right now.", chat_id=chat_id)
+        return
+
+    msg = f"🔍 <b>Pending Account Suggestions</b> ({len(rows)})\n\n"
+    for r in rows:
+        msg += (f"<b>@{r['handle']}</b> — {r['score']}/10 {r['label']}\n"
+                f"  Followers: {r['followers']:,}\n"
+                f"  /approve {r['handle']}  |  /reject {r['handle']}\n\n")
+    send_message(msg, chat_id=chat_id)

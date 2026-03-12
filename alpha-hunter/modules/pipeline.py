@@ -216,3 +216,35 @@ def research_tweet_url(tweet_url: str, chat_id: str = None):
         action_plan = generate_action_plan(project, score_result)
         message = format_action_plan_for_telegram(project, score_result, action_plan)
         send_message(message, chat_id=chat_id)
+
+
+def run_discovery_cycle():
+    """
+    Network discovery run — separate from main scan cycle.
+    Runs less frequently (every 24h).
+    Finds new accounts from trusted network interactions.
+    """
+    from modules.account_discovery import (
+        discover_accounts, save_pending_suggestion,
+        format_suggestion_message
+    )
+
+    logger.info("=" * 60)
+    logger.info("🔍 Network Discovery Starting")
+    logger.info("=" * 60)
+
+    watchlist = _load_watchlist()
+    candidates = discover_accounts(watchlist)
+
+    if not candidates:
+        logger.info("No new candidates found this cycle")
+        return
+
+    for candidate in candidates:
+        save_pending_suggestion(candidate)
+        message = format_suggestion_message(candidate)
+        send_message(message)
+        time.sleep(2)
+
+    logger.info("Discovery complete — %d suggestions sent to Telegram",
+                len(candidates))
