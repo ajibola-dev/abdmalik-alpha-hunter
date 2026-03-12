@@ -1,8 +1,14 @@
 """
 modules/scheduler.py
-Two separate schedules:
-  - Main scan:       every SCAN_INTERVAL_HOURS (default 4h)
-  - Discovery scan:  every 24h (network account discovery)
+Four independent schedules running concurrently:
+
+  Every 4h  — X Monitor scan (Zun + watchlist tweets)
+  Every 12h — Funding scan (DeFiLlama + CryptoRank, all categories)
+  Every 24h — GitHub scan (technical signals before Twitter)
+  Every 24h — Network discovery (find new alpha accounts)
+
+All run in background threads except the X monitor which runs
+in the main thread.
 """
 import logging
 import time
@@ -12,41 +18,72 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 
-def run_scheduler():
-    """Run main scan cycle on schedule."""
-    from modules.pipeline import run_scan_cycle
-    interval = settings.SCAN_INTERVAL_HOURS * 3600
-    logger.info("Main scheduler started — scanning every %dh",
-                settings.SCAN_INTERVAL_HOURS)
+def _run_loop(name: str, fn, interval_seconds: int, initial_delay: int = 0):
+    """Generic scheduler loop."""
+    if initial_delay:
+        logger.info("%s starting in %dm", name, initial_delay // 60)
+        time.sleep(initial_delay)
     while True:
+        logger.info("▶️  %s starting", name)
         try:
-            run_scan_cycle()
+            fn()
         except Exception as exc:
-            logger.error("Scan cycle failed: %s", exc, exc_info=True)
-        logger.info("Next main scan in %dh", settings.SCAN_INTERVAL_HOURS)
-        time.sleep(interval)
-
-
-def run_discovery_scheduler():
-    """Run network discovery every 24h in background thread."""
-    from modules.pipeline import run_discovery_cycle
-    logger.info("Discovery scheduler started — running every 24h")
-    # Wait 1h before first discovery run (let main scan run first)
-    time.sleep(3600)
-    while True:
-        try:
-            run_discovery_cycle()
-        except Exception as exc:
-            logger.error("Discovery cycle failed: %s", exc, exc_info=True)
-        logger.info("Next discovery in 24h")
-        time.sleep(86400)
+            logger.error("%s failed: %s", name, exc, exc_info=True)
+        logger.info("⏸️  %s done — next in %dh",
+                    name, interval_seconds // 3600)
+        time.sleep(interval_seconds)
 
 
 def start_all_schedulers():
-    """Start discovery in background, run main scan in foreground."""
-    discovery_thread = threading.Thread(
-        target=run_discovery_scheduler, daemon=True
+    """
+    Start all scan cycles.
+    Funding + GitHub + Discovery run in background threads.
+    X monitor runs in foreground (main thread).
+    """
+    from modules.pipeline import (
+        run_scan_cycle,
+        run_funding_scan_cycle,
+        run_github_scan_cycle,
+        run_discovery_cycle,
     )
-    discovery_thread.start()
-    logger.info("Discovery scheduler running in background")
-    run_scheduler()  # Blocking
+
+    scan_interval = settings.SCAN_INTERVAL_HOURS * 3600
+
+    # ── Background threads ─────────────────────────────────────────────────
+    threads = [
+        threading.Thread(
+            target=_run_loop,
+            args=("Funding Scanner", run_funding_scan_cycle, 43200, 300),
+            daemon=True, name="funding-scanner"
+        ),
+        threading.Thread(
+            target=_run_loop,
+            args=("GitHub Scanner", run_github_scan_cycle, 86400, 1800),
+            daemon=True, name="github-scanner"
+        ),
+        threading.Thread(
+            target=_run_loop,
+            args=("Network Discovery", run_discovery_cycle, 86400, 3600),
+            daemon=True, name="network-discovery"
+        ),
+    ]
+
+    for t in threads:
+        t.start()
+        logger.info("Started background thread: %s", t.name)
+
+    logger.info(
+        "\n"
+        "=" * 55 + "\n"
+        "  🎯 ALPHA HUNTER — ALL SYSTEMS ACTIVE\n"
+        "=" * 55 + "\n"
+        "  X Monitor:        every %dh\n"
+        "  Funding Scanner:  every 12h\n"
+        "  GitHub Scanner:   every 24h\n"
+        "  Network Discovery: every 24h\n"
+        "=" * 55,
+        settings.SCAN_INTERVAL_HOURS
+    )
+
+    # ── Foreground: X monitor ──────────────────────────────────────────────
+    _run_loop("X Monitor", run_scan_cycle, scan_interval)

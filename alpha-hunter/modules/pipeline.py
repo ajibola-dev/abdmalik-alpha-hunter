@@ -14,6 +14,7 @@ import logging
 import time
 from config.settings import settings
 from modules import database as db
+from modules.database import already_alerted
 from modules.x_monitor import monitor_all_accounts, fetch_tweet_from_url
 from modules.project_extractor import extract_project_names, score_tweet_quality
 from modules.researcher import research_project
@@ -248,3 +249,75 @@ def run_discovery_cycle():
 
     logger.info("Discovery complete — %d suggestions sent to Telegram",
                 len(candidates))
+
+
+def run_funding_scan_cycle():
+    """
+    Funding scan cycle — runs every 12 hours.
+    Covers DeFiLlama + CryptoRank across ALL categories.
+    """
+    from modules.funding_scanner import run_funding_scan
+    from modules.action_planner import generate_action_plan, format_action_plan_for_telegram
+
+    logger.info("=" * 60)
+    logger.info("💰 Funding Scan Cycle Starting")
+    logger.info("=" * 60)
+
+    qualified = run_funding_scan()
+    genesis_count = 0
+
+    for item in qualified:
+        project = item["project"]
+        project_id = item["project_id"]
+        score_result = item["score_result"]
+
+        if (not already_alerted(project_id, "funding") and
+                db.alerts_today() < settings.MAX_ALERTS_PER_DAY):
+
+            action_plan = generate_action_plan(project, score_result)
+            message = (
+                "💰 <b>ALPHA HUNTER — FUNDING SIGNAL</b>\n"
+                f"<i>Source: {project.get('source','').upper()}</i>\n\n"
+            ) + format_action_plan_for_telegram(project, score_result, action_plan)
+
+            if send_message(message):
+                db.log_alert(project_id, "funding")
+                genesis_count += 1
+
+    logger.info("Funding cycle complete — %d alerts sent", genesis_count)
+
+
+def run_github_scan_cycle():
+    """
+    GitHub scan cycle — runs every 24 hours.
+    Finds technical signals before they appear on Twitter.
+    """
+    from modules.github_scanner import run_github_scan
+    from modules.action_planner import generate_action_plan, format_action_plan_for_telegram
+
+    logger.info("=" * 60)
+    logger.info("⚙️  GitHub Scan Cycle Starting")
+    logger.info("=" * 60)
+
+    qualified = run_github_scan()
+    genesis_count = 0
+
+    for item in qualified:
+        project = item["project"]
+        project_id = item["project_id"]
+        score_result = item["score_result"]
+
+        if (not already_alerted(project_id, "github") and
+                db.alerts_today() < settings.MAX_ALERTS_PER_DAY):
+
+            action_plan = generate_action_plan(project, score_result)
+            message = (
+                "⚙️ <b>ALPHA HUNTER — GITHUB SIGNAL</b>\n"
+                f"<i>Detected on GitHub before Twitter</i>\n\n"
+            ) + format_action_plan_for_telegram(project, score_result, action_plan)
+
+            if send_message(message):
+                db.log_alert(project_id, "github")
+                genesis_count += 1
+
+    logger.info("GitHub cycle complete — %d alerts sent", genesis_count)
