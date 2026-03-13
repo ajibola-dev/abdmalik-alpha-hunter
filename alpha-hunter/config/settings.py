@@ -37,6 +37,12 @@ class Settings:
         "https://nitter.privacydev.net",
         "https://nitter.poast.org",
         "https://nitter.1d4.us",
+        "https://nitter.tiekoetter.com",
+        "https://nitter.rawbit.ninja",
+        "https://nitter.unixfox.eu",
+        "https://nitter.esmailelbob.xyz",
+        "https://nitter.weiler.rocks",
+        "https://nitter.sethforprivacy.com",
     ]
 
     # ── Top tier VCs ───────────────────────────────────────────────────────
