@@ -24,6 +24,7 @@ class Settings:
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
     CMC_API_KEY: str = os.getenv("CMC_API_KEY", "")
     X_BEARER_TOKEN: str = os.getenv("X_BEARER_TOKEN", "")
+    RAPIDAPI_KEY: str = os.getenv("RAPIDAPI_KEY", "")
 
     # ── Scoring thresholds ─────────────────────────────────────────────────
     GENESIS_THRESHOLD: int = int(os.getenv("GENESIS_THRESHOLD", "7"))
