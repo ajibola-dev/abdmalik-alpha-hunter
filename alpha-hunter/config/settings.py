@@ -23,6 +23,7 @@ class Settings:
     # ── API Keys (optional — improves research quality) ────────────────────
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
     CMC_API_KEY: str = os.getenv("CMC_API_KEY", "")
+    X_BEARER_TOKEN: str = os.getenv("X_BEARER_TOKEN", "")
 
     # ── Scoring thresholds ─────────────────────────────────────────────────
     GENESIS_THRESHOLD: int = int(os.getenv("GENESIS_THRESHOLD", "7"))
@@ -37,12 +38,6 @@ class Settings:
         "https://nitter.privacydev.net",
         "https://nitter.poast.org",
         "https://nitter.1d4.us",
-        "https://nitter.tiekoetter.com",
-        "https://nitter.rawbit.ninja",
-        "https://nitter.unixfox.eu",
-        "https://nitter.esmailelbob.xyz",
-        "https://nitter.weiler.rocks",
-        "https://nitter.sethforprivacy.com",
     ]
 
     # ── Top tier VCs ───────────────────────────────────────────────────────
