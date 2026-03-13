@@ -1,178 +1,141 @@
 """
 modules/x_monitor.py
-Monitors X accounts via Nitter scraping.
-No API key needed. Rotates across multiple Nitter instances.
-Also handles manual tweet URL forwards from Telegram.
+Monitors X accounts via the official X API v2.
+Uses Bearer Token authentication — no Nitter needed.
 """
 import logging
 import time
-import random
 import re
-from typing import Optional
+import os
 import requests
-from bs4 import BeautifulSoup
+from typing import Optional
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+_API_BASE = "https://api.twitter.com/2"
+_seen_tweet_ids: set = set()
 _SESSION = requests.Session()
 
-# ── Nitter instance health check ──────────────────────────────────────────
-_healthy_instances: list[str] = []
-_last_health_check: float = 0
+
+def _get_headers() -> dict:
+    token = getattr(settings, "X_BEARER_TOKEN", "") or os.getenv("X_BEARER_TOKEN", "")
+    if not token:
+        logger.error("X_BEARER_TOKEN not set!")
+        return {}
+    return {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "AlphaHunterBot/1.0",
+    }
 
 
-def _get_healthy_instance() -> str | None:
-    """Returns a working Nitter instance, checking health every 30 mins."""
-    global _healthy_instances, _last_health_check
-    import time as _time
-
-    if _healthy_instances and (_time.time() - _last_health_check) < 1800:
-        import random
-        return random.choice(_healthy_instances)
-
-    # Re-check all instances
-    _healthy_instances = []
-    for instance in settings.NITTER_INSTANCES:
-        try:
-            r = _SESSION.get(f"{instance}/twitter", timeout=8)
-            if r.status_code == 200:
-                _healthy_instances.append(instance)
-                logger.debug("Nitter healthy: %s", instance)
-        except Exception:
-            logger.debug("Nitter down: %s", instance)
-
-    _last_health_check = _time.time()
-
-    if not _healthy_instances:
-        logger.warning("All Nitter instances are down!")
+def _get(url: str, params: dict = None) -> Optional[dict]:
+    headers = _get_headers()
+    if not headers:
+        return None
+    try:
+        r = _SESSION.get(url, headers=headers, params=params, timeout=20)
+        if r.status_code == 429:
+            logger.warning("X API rate limited — sleeping 60s")
+            time.sleep(60)
+            return None
+        if r.status_code == 401:
+            logger.error("X API 401 Unauthorized — check Bearer Token")
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        logger.warning("X API request failed: %s", exc)
         return None
 
-    logger.info("Healthy Nitter instances: %d/%d",
-                len(_healthy_instances), len(settings.NITTER_INSTANCES))
-    import random
-    return random.choice(_healthy_instances)
-_SESSION.headers.update(settings.REQUEST_HEADERS)
 
-
-def _get(url: str, retries: int = 3) -> Optional[requests.Response]:
-    for attempt in range(retries):
-        try:
-            r = _SESSION.get(url, timeout=settings.REQUEST_TIMEOUT)
-            r.raise_for_status()
-            return r
-        except requests.RequestException as exc:
-            if attempt == retries - 1:
-                logger.warning("GET %s failed: %s", url, exc)
-            time.sleep(2 ** attempt)
+def get_user_id(handle: str) -> Optional[str]:
+    """Look up a Twitter user ID by handle."""
+    data = _get(f"{_API_BASE}/users/by/username/{handle}")
+    if data and "data" in data:
+        return data["data"]["id"]
+    logger.warning("Could not find user ID for @%s", handle)
     return None
 
 
-def _nitter_url(handle: str, instance: str = None) -> str:
-    """Build a Nitter profile URL for a given handle."""
-    instance = instance or random.choice(settings.NITTER_INSTANCES)
-    return f"{instance}/{handle}"
-
-
-def fetch_recent_tweets(handle: str, max_tweets: int = 20) -> list[dict]:
+def fetch_recent_tweets(handle: str, max_results: int = 10) -> list[dict]:
     """
-    Scrape recent tweets from a user's Nitter profile.
-    Returns list of {text, url, date, handle}
+    Fetch recent tweets from a user via X API v2.
+    Returns list of {handle, text, url, id, date}
     """
+    user_id = get_user_id(handle)
+    if not user_id:
+        return []
+
+    params = {
+        "max_results": min(max_results, 100),
+        "tweet.fields": "created_at,text",
+        "exclude": "retweets,replies",
+    }
+
+    data = _get(f"{_API_BASE}/users/{user_id}/tweets", params=params)
+    if not data or "data" not in data:
+        logger.warning("No tweets returned for @%s", handle)
+        return []
+
     tweets = []
-
-    for instance in settings.NITTER_INSTANCES:
-        url = _nitter_url(handle, instance)
-        resp = _get(url)
-        if resp is None:
+    for tweet in data["data"]:
+        tweet_id = tweet["id"]
+        if tweet_id in _seen_tweet_ids:
             continue
+        _seen_tweet_ids.add(tweet_id)
 
-        try:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            tweet_items = soup.select(".timeline-item, .tweet-content, [class*='timeline']")
+        tweets.append({
+            "handle": handle,
+            "text": tweet["text"],
+            "url": f"https://twitter.com/{handle}/status/{tweet_id}",
+            "id": tweet_id,
+            "date": tweet.get("created_at", ""),
+        })
 
-            if not tweet_items:
-                # Try alternate selectors
-                tweet_items = soup.select("div.tweet")
+    if tweets:
+        logger.info("Fetched %d new tweets from @%s", len(tweets), handle)
+    else:
+        logger.info("No new tweets from @%s (all seen or none posted)", handle)
 
-            for item in tweet_items[:max_tweets]:
-                text_el = item.select_one(".tweet-content, .content")
-                date_el = item.select_one(".tweet-date a, time")
-                link_el = item.select_one(".tweet-link, a[href*='/status/']")
-
-                text = text_el.get_text(strip=True) if text_el else ""
-                date = date_el.get("title", date_el.get_text(strip=True)) if date_el else ""
-                link = link_el.get("href", "") if link_el else ""
-
-                if not link.startswith("http"):
-                    link = f"https://twitter.com{link}"
-
-                if text:
-                    tweets.append({
-                        "handle": handle,
-                        "text": text,
-                        "url": link,
-                        "date": date,
-                    })
-
-            if tweets:
-                logger.info("Fetched %d tweets from @%s via %s", len(tweets), handle, instance)
-                return tweets
-
-        except Exception as exc:
-            logger.debug("Nitter parse error (%s): %s", instance, exc)
-            continue
-
-    logger.warning("Could not fetch tweets for @%s from any Nitter instance", handle)
-    return []
+    return tweets
 
 
 def fetch_tweet_from_url(tweet_url: str) -> Optional[dict]:
-    """
-    Fetch a single tweet from a URL.
-    Converts twitter.com or x.com URLs to Nitter for scraping.
-    """
-    # Convert to Nitter URL
-    for domain in ["twitter.com", "x.com"]:
-        if domain in tweet_url:
-            path = tweet_url.split(domain)[-1]
-            for instance in settings.NITTER_INSTANCES:
-                nitter_url = f"{instance}{path}"
-                resp = _get(nitter_url)
-                if resp is None:
-                    continue
-                try:
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    text_el = soup.select_one(".tweet-content, .main-tweet .content")
-                    if text_el:
-                        return {
-                            "handle": "manual_forward",
-                            "text": text_el.get_text(strip=True),
-                            "url": tweet_url,
-                            "date": "manual",
-                        }
-                except Exception as exc:
-                    logger.debug("Manual tweet fetch error: %s", exc)
-                    continue
+    """Fetch a single tweet by URL — for manual /research command."""
+    match = re.search(r'/status/(\d+)', tweet_url)
+    if not match:
+        return None
 
-    return None
+    tweet_id = match.group(1)
+    data = _get(f"{_API_BASE}/tweets/{tweet_id}",
+                params={"tweet.fields": "created_at,text"})
+    if not data or "data" not in data:
+        return None
+
+    tweet = data["data"]
+    return {
+        "handle": "manual_forward",
+        "text": tweet["text"],
+        "url": tweet_url,
+        "id": tweet_id,
+        "date": tweet.get("created_at", "manual"),
+    }
 
 
 def monitor_all_accounts(watchlist: list[dict]) -> list[dict]:
-    """
-    Fetch recent tweets from all accounts in watchlist.
-    Returns all new tweets across all accounts.
-    """
+    """Fetch recent tweets from all accounts in watchlist."""
     all_tweets = []
+
     for account in watchlist:
         handle = account.get("handle", "")
         if not handle:
             continue
         logger.info("Checking @%s...", handle)
-        tweets = fetch_recent_tweets(handle)
+        tweets = fetch_recent_tweets(handle, max_results=10)
         all_tweets.extend(tweets)
-        time.sleep(2)  # Be polite to Nitter
+        time.sleep(3)  # Respect rate limits
 
-    logger.info("Total tweets fetched: %d from %d accounts",
+    logger.info("Total new tweets: %d from %d accounts",
                 len(all_tweets), len(watchlist))
     return all_tweets
