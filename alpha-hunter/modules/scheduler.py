@@ -72,18 +72,13 @@ def start_all_schedulers():
         t.start()
         logger.info("Started background thread: %s", t.name)
 
-    logger.info(
-        "\n"
-        "=" * 55 + "\n"
-        "  🎯 ALPHA HUNTER — ALL SYSTEMS ACTIVE\n"
-        "=" * 55 + "\n"
-        "  X Monitor:        every %dh\n"
-        "  Funding Scanner:  every 12h\n"
-        "  GitHub Scanner:   every 24h\n"
-        "  Network Discovery: every 24h\n"
-        "=" * 55,
-        settings.SCAN_INTERVAL_HOURS
-    )
+    logger.info("=" * 55)
+    logger.info("  ALPHA HUNTER — ALL SYSTEMS ACTIVE")
+    logger.info("  X Monitor:        every %sh", settings.SCAN_INTERVAL_HOURS)
+    logger.info("  Funding Scanner:  every 12h")
+    logger.info("  GitHub Scanner:   every 24h")
+    logger.info("  Network Discovery: every 24h")
+    logger.info("=" * 55)
 
     # ── Foreground: X monitor ──────────────────────────────────────────────
     _run_loop("X Monitor", run_scan_cycle, scan_interval)
