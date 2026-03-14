@@ -1,14 +1,18 @@
 """
 modules/scheduler.py
-Four independent schedules running concurrently:
+Four independent schedules running concurrently.
 
-  Every 4h  — X Monitor scan (Zun + watchlist tweets)
-  Every 12h — Funding scan (DeFiLlama + CryptoRank, all categories)
+v0.4 change:
+  - X Monitor now runs run_scan_cycle_async() from pipeline_async.py
+    instead of the sync run_scan_cycle() from pipeline.py
+  - If aiohttp is not installed, automatically falls back to sync scan
+  - All other cycles unchanged
+
+Schedule:
+  Every 4h  — X Monitor scan (async research)
+  Every 12h — Funding scan (DeFiLlama + CryptoRank)
   Every 24h — GitHub scan (technical signals before Twitter)
   Every 24h — Network discovery (find new alpha accounts)
-
-All run in background threads except the X monitor which runs
-in the main thread.
 """
 import logging
 import time
@@ -38,14 +42,23 @@ def start_all_schedulers():
     """
     Start all scan cycles.
     Funding + GitHub + Discovery run in background threads.
-    X monitor runs in foreground (main thread).
+    X monitor (async) runs in foreground (main thread).
     """
     from modules.pipeline import (
-        run_scan_cycle,
         run_funding_scan_cycle,
         run_github_scan_cycle,
         run_discovery_cycle,
     )
+
+    # v0.4: use async scan cycle; fall back to sync if aiohttp not available
+    try:
+        from modules.pipeline_async import run_scan_cycle_async
+        scan_fn = run_scan_cycle_async
+        logger.info("Using async scan cycle (aiohttp available)")
+    except ImportError:
+        from modules.pipeline import run_scan_cycle
+        scan_fn = run_scan_cycle
+        logger.info("Using sync scan cycle (aiohttp not available)")
 
     scan_interval = settings.SCAN_INTERVAL_HOURS * 3600
 
@@ -74,11 +87,11 @@ def start_all_schedulers():
 
     logger.info("=" * 55)
     logger.info("  ALPHA HUNTER — ALL SYSTEMS ACTIVE")
-    logger.info("  X Monitor:        every %sh", settings.SCAN_INTERVAL_HOURS)
+    logger.info("  X Monitor:        every %sh (async)", settings.SCAN_INTERVAL_HOURS)
     logger.info("  Funding Scanner:  every 12h")
     logger.info("  GitHub Scanner:   every 24h")
     logger.info("  Network Discovery: every 24h")
     logger.info("=" * 55)
 
-    # ── Foreground: X monitor ──────────────────────────────────────────────
-    _run_loop("X Monitor", run_scan_cycle, scan_interval)
+    # ── Foreground: X monitor (async) ──────────────────────────────────────
+    _run_loop("X Monitor", scan_fn, scan_interval)

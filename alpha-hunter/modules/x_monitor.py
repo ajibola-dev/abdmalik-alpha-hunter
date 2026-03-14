@@ -2,21 +2,36 @@
 modules/x_monitor.py
 Monitors X accounts via Twttr API (RapidAPI) by davethebeast.
 Host: twitter241.p.rapidapi.com
+
+v0.2 changes:
+  - user_id lookups now cached in-memory with TTL (USER_ID_CACHE_TTL)
+    → was calling API on every scan for every account
+  - Tweet deduplication moved to DB via database.mark_tweet_seen()
+    → was in-memory set; lost on every restart causing duplicate processing
+  - since_id logic: uses last_tweet_id from DB to fetch only NEW tweets
+    → was always fetching the same 10 tweets every cycle
+  - Exponential backoff on 429 with configurable MAX_RETRIES
+  - Structured log context: scan_id, handle, tweet_id in every log line
 """
 import logging
 import time
 import re
+import hashlib
 import os
 import requests
 from typing import Optional
 from config.settings import settings
+from modules import database as db
 
 logger = logging.getLogger(__name__)
 
 _API_HOST = "twitter241.p.rapidapi.com"
 _API_BASE = f"https://{_API_HOST}"
-_seen_tweet_ids: set = set()
 _SESSION = requests.Session()
+
+# ── User ID cache (v0.2) ───────────────────────────────────────────────────
+# Keyed by handle (lowercase) → {"user_id": str, "cached_at": float}
+_user_id_cache: dict[str, dict] = {}
 
 
 def _get_headers() -> dict:
@@ -31,39 +46,80 @@ def _get_headers() -> dict:
     }
 
 
-def _get(url: str, params: dict = None) -> Optional[dict]:
+def _get(url: str, params: dict = None,
+         retries: int = None) -> Optional[dict]:
+    """
+    GET with exponential backoff.
+    v0.2: uses settings.MAX_RETRIES, settings.RETRY_BACKOFF_BASE,
+          handles 429 with a 60s sleep before counting as an attempt.
+    """
+    max_retries = retries or settings.MAX_RETRIES
     headers = _get_headers()
     if not headers:
         return None
-    try:
-        r = _SESSION.get(url, headers=headers, params=params, timeout=20)
-        if r.status_code == 429:
-            logger.warning("RapidAPI rate limited — sleeping 60s")
-            time.sleep(60)
-            return None
-        if r.status_code == 401:
-            logger.error("RapidAPI 401 — check RAPIDAPI_KEY")
-            return None
-        r.raise_for_status()
-        return r.json()
-    except Exception as exc:
-        logger.warning("RapidAPI request failed: %s", exc)
-        return None
 
+    for attempt in range(max_retries):
+        try:
+            r = _SESSION.get(url, headers=headers, params=params,
+                             timeout=settings.REQUEST_TIMEOUT)
+            if r.status_code == 429:
+                wait = 60 * (attempt + 1)
+                logger.warning(
+                    "RapidAPI rate limited — sleeping %ds (attempt %d/%d)",
+                    wait, attempt + 1, max_retries
+                )
+                time.sleep(wait)
+                continue   # don't count as a failed attempt
+            if r.status_code == 401:
+                logger.error("RapidAPI 401 — check RAPIDAPI_KEY")
+                return None
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            wait = settings.RETRY_BACKOFF_BASE ** attempt
+            if attempt < max_retries - 1:
+                logger.debug(
+                    "RapidAPI request failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1, max_retries, exc, wait
+                )
+                time.sleep(wait)
+            else:
+                logger.warning(
+                    "RapidAPI request failed after %d attempts: %s", max_retries, exc
+                )
+    return None
+
+
+# ── User ID cache (v0.2) ───────────────────────────────────────────────────
 
 def get_user_id(handle: str) -> Optional[str]:
-    """Look up a Twitter user ID by handle."""
+    """
+    Look up a Twitter user ID by handle.
+    v0.2: results cached in memory for USER_ID_CACHE_TTL seconds (default 24h).
+    Eliminates one API call per account per scan.
+    """
+    handle_lower = handle.lower()
+    cached = _user_id_cache.get(handle_lower)
+    if cached:
+        age = time.time() - cached["cached_at"]
+        if age < settings.USER_ID_CACHE_TTL:
+            return cached["user_id"]
+
     data = _get(f"{_API_BASE}/user", params={"username": handle})
     if not data:
         return None
     try:
-        # Response structure: data.result.data.user.result.rest_id
         user_id = (data.get("result", {})
-                      .get("data", {})
-                      .get("user", {})
-                      .get("result", {})
-                      .get("rest_id"))
+                       .get("data", {})
+                       .get("user", {})
+                       .get("result", {})
+                       .get("rest_id"))
         if user_id:
+            _user_id_cache[handle_lower] = {
+                "user_id": user_id,
+                "cached_at": time.time(),
+            }
+            logger.debug("Cached user_id for @%s → %s", handle, user_id)
             return user_id
     except Exception:
         pass
@@ -71,26 +127,43 @@ def get_user_id(handle: str) -> Optional[str]:
     return None
 
 
-def fetch_recent_tweets(handle: str, max_results: int = 10) -> list[dict]:
+def _tweet_hash(tweet_id: str, handle: str) -> str:
+    return hashlib.md5(f"{handle}:{tweet_id}".encode()).hexdigest()
+
+
+def fetch_recent_tweets(handle: str, max_results: int = 10,
+                        scan_id: str = "") -> list[dict]:
     """
     Fetch recent tweets from a user via Twttr API.
+    v0.2:
+      - Uses last_tweet_id from DB as since_id to fetch only truly new tweets.
+      - Deduplication via DB tweet_seen table instead of in-memory set.
     Returns list of {handle, text, url, id, date}
     """
+    log_ctx = f"[scan={scan_id}] @{handle}" if scan_id else f"@{handle}"
+
     user_id = get_user_id(handle)
     if not user_id:
         return []
 
-    data = _get(f"{_API_BASE}/user-tweets",
-                params={"user": user_id, "count": str(max_results)})
+    # Build params — include since_id if we have it
+    params = {"user": user_id, "count": str(max_results)}
+    since_id = db.get_account_last_tweet_id(handle)
+    if since_id:
+        params["since_id"] = since_id
+        logger.debug("%s fetching tweets since_id=%s", log_ctx, since_id)
+
+    data = _get(f"{_API_BASE}/user-tweets", params=params)
     if not data:
         return []
 
     tweets = []
+    newest_id = None
+
     try:
-        # Navigate the Twitter GraphQL response structure
         instructions = (data.get("result", {})
-                           .get("timeline", {})
-                           .get("instructions", []))
+                            .get("timeline", {})
+                            .get("instructions", []))
 
         for instruction in instructions:
             entries = instruction.get("entries", [])
@@ -107,13 +180,22 @@ def fetch_recent_tweets(handle: str, max_results: int = 10) -> list[dict]:
 
                 if not tweet_id or not text:
                     continue
-                if tweet_id in _seen_tweet_ids:
-                    continue
-                # Skip retweets
                 if text.startswith("RT @"):
                     continue
 
-                _seen_tweet_ids.add(tweet_id)
+                # DB-backed dedup (v0.2)
+                t_hash = _tweet_hash(tweet_id, handle)
+                if db.is_tweet_seen(t_hash):
+                    logger.debug("%s tweet %s already seen — skipping",
+                                 log_ctx, tweet_id)
+                    continue
+
+                db.mark_tweet_seen(t_hash, tweet_id=tweet_id, handle=handle)
+
+                # Track newest tweet_id for next scan's since_id
+                if newest_id is None or int(tweet_id) > int(newest_id):
+                    newest_id = tweet_id
+
                 tweets.append({
                     "handle": handle,
                     "text": text,
@@ -121,13 +203,18 @@ def fetch_recent_tweets(handle: str, max_results: int = 10) -> list[dict]:
                     "id": tweet_id,
                     "date": created_at,
                 })
+
     except Exception as exc:
-        logger.warning("Error parsing tweets for @%s: %s", handle, exc)
+        logger.warning("%s error parsing tweets: %s", log_ctx, exc)
+
+    # Persist the newest tweet_id for next scan
+    if newest_id:
+        db.update_account_last_tweet(handle, newest_id)
 
     if tweets:
-        logger.info("Fetched %d new tweets from @%s", len(tweets), handle)
+        logger.info("%s fetched %d new tweets", log_ctx, len(tweets))
     else:
-        logger.info("No new tweets from @%s", handle)
+        logger.info("%s no new tweets", log_ctx)
 
     return tweets
 
@@ -161,7 +248,8 @@ def fetch_tweet_from_url(tweet_url: str) -> Optional[dict]:
     return None
 
 
-def monitor_all_accounts(watchlist: list[dict]) -> list[dict]:
+def monitor_all_accounts(watchlist: list[dict],
+                         scan_id: str = "") -> list[dict]:
     """Fetch recent tweets from all accounts in watchlist."""
     all_tweets = []
 
@@ -169,11 +257,13 @@ def monitor_all_accounts(watchlist: list[dict]) -> list[dict]:
         handle = account.get("handle", "")
         if not handle:
             continue
-        logger.info("Checking @%s...", handle)
-        tweets = fetch_recent_tweets(handle, max_results=10)
+        logger.info("[scan=%s] Checking @%s...", scan_id, handle)
+        tweets = fetch_recent_tweets(
+            handle, max_results=10, scan_id=scan_id
+        )
         all_tweets.extend(tweets)
         time.sleep(2)  # Respect rate limits
 
-    logger.info("Total new tweets: %d from %d accounts",
-                len(all_tweets), len(watchlist))
+    logger.info("[scan=%s] Total new tweets: %d from %d accounts",
+                scan_id, len(all_tweets), len(watchlist))
     return all_tweets

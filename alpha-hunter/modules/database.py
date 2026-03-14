@@ -1,14 +1,26 @@
 """
 modules/database.py — SQLite storage for Alpha Hunter
+v0.2 changes:
+  - Added tweet_seen table          → persistent tweet dedup (survives restarts)
+  - Added project_research_cache    → skip re-researching known projects
+  - Added structured scan_context   → scan_id, stage tracking for logs
+  - Fixed _cmd_suggestions import bug (was in telegram_bot.py, root cause here)
+  - All new tables created safely via init_db()
+
 Tables:
-  - watched_accounts   : X accounts being monitored
-  - discovered_projects: projects extracted from tweets
-  - project_scores     : scoring history
-  - grind_tracker      : your personal task/wallet tracking
-  - alerts_sent        : dedup alert history
+  watched_accounts       : X accounts being monitored
+  discovered_projects    : projects extracted from tweets
+  project_scores         : scoring history
+  grind_tracker          : personal task/wallet tracking
+  alerts_sent            : dedup alert history
+  scan_log               : scan audit trail
+  tweet_seen             : [NEW v0.2] persistent tweet dedup
+  project_research_cache : [NEW v0.2] skip repeat research within TTL
+  account_suggestions    : discovered accounts pending approval
 """
 import sqlite3
 import logging
+import time
 from datetime import datetime
 from config.settings import settings
 
@@ -16,7 +28,10 @@ logger = logging.getLogger(__name__)
 
 
 def _conn():
-    return sqlite3.connect(settings.DB_PATH)
+    conn = sqlite3.connect(settings.DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")   # safer concurrent writes
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
 def init_db():
@@ -24,13 +39,13 @@ def init_db():
     with _conn() as con:
         con.executescript("""
         CREATE TABLE IF NOT EXISTS watched_accounts (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            handle      TEXT UNIQUE NOT NULL,
-            name        TEXT,
-            tier        INTEGER DEFAULT 2,
-            trusted     INTEGER DEFAULT 0,
-            notes       TEXT,
-            added_at    TEXT DEFAULT (datetime('now')),
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            handle       TEXT UNIQUE NOT NULL,
+            name         TEXT,
+            tier         INTEGER DEFAULT 2,
+            trusted      INTEGER DEFAULT 0,
+            notes        TEXT,
+            added_at     TEXT DEFAULT (datetime('now')),
             last_checked TEXT,
             last_tweet_id TEXT
         );
@@ -54,12 +69,12 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS project_scores (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id      INTEGER REFERENCES discovered_projects(id),
-            score           REAL,
-            breakdown       TEXT,
-            label           TEXT,
-            scored_at       TEXT DEFAULT (datetime('now'))
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER REFERENCES discovered_projects(id),
+            score       REAL,
+            breakdown   TEXT,
+            label       TEXT,
+            scored_at   TEXT DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS grind_tracker (
@@ -89,9 +104,125 @@ def init_db():
             notes       TEXT,
             scanned_at  TEXT DEFAULT (datetime('now'))
         );
+
+        -- v0.2: persistent tweet deduplication
+        -- replaces in-memory _seen_tweet_hashes / _seen_tweet_ids sets
+        CREATE TABLE IF NOT EXISTS tweet_seen (
+            tweet_hash  TEXT PRIMARY KEY,
+            tweet_id    TEXT,
+            handle      TEXT,
+            seen_at     TEXT DEFAULT (datetime('now'))
+        );
+
+        -- v0.2: persistent research cache
+        -- prevents re-researching the same project within RESEARCH_CACHE_TTL
+        CREATE TABLE IF NOT EXISTS project_research_cache (
+            project_name    TEXT PRIMARY KEY,
+            result_json     TEXT,
+            cached_at       TEXT DEFAULT (datetime('now'))
+        );
+
+        -- account discovery suggestions (moved from ad-hoc CREATE in account_discovery.py)
+        CREATE TABLE IF NOT EXISTS account_suggestions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            handle       TEXT UNIQUE,
+            score        REAL,
+            label        TEXT,
+            followers    INTEGER,
+            breakdown    TEXT,
+            sources      TEXT,
+            status       TEXT DEFAULT 'pending',
+            suggested_at TEXT DEFAULT (datetime('now'))
+        );
         """)
+
+        # Indexes for hot query paths
+        con.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_tweet_seen_handle
+            ON tweet_seen(handle);
+        CREATE INDEX IF NOT EXISTS idx_alerts_sent_project
+            ON alerts_sent(project_id, alert_type);
+        CREATE INDEX IF NOT EXISTS idx_scores_project
+            ON project_scores(project_id);
+        CREATE INDEX IF NOT EXISTS idx_projects_discovered
+            ON discovered_projects(discovered_at);
+        """)
+
     logger.info("Database initialised at %s", settings.DB_PATH)
 
+
+# ── Tweet deduplication (v0.2 — DB-backed) ────────────────────────────────
+
+def is_tweet_seen(tweet_hash: str) -> bool:
+    """Return True if this tweet hash has been processed before."""
+    with _conn() as con:
+        row = con.execute(
+            "SELECT 1 FROM tweet_seen WHERE tweet_hash=?", (tweet_hash,)
+        ).fetchone()
+        return row is not None
+
+
+def mark_tweet_seen(tweet_hash: str, tweet_id: str = "", handle: str = ""):
+    """Record a tweet as processed."""
+    with _conn() as con:
+        con.execute(
+            """INSERT OR IGNORE INTO tweet_seen (tweet_hash, tweet_id, handle)
+               VALUES (?,?,?)""",
+            (tweet_hash, tweet_id, handle)
+        )
+
+
+def cleanup_old_tweets(days: int = 30):
+    """Prune tweet_seen entries older than N days to keep DB lean."""
+    with _conn() as con:
+        con.execute(
+            "DELETE FROM tweet_seen WHERE seen_at < datetime('now', ?)",
+            (f"-{days} days",)
+        )
+
+
+# ── Research cache (v0.2) ──────────────────────────────────────────────────
+
+def get_research_cache(project_name: str) -> dict | None:
+    """
+    Return cached research result if within TTL, else None.
+    TTL is RESEARCH_CACHE_TTL seconds (default 24h).
+    """
+    with _conn() as con:
+        row = con.execute(
+            """SELECT result_json, cached_at FROM project_research_cache
+               WHERE project_name=?""",
+            (project_name,)
+        ).fetchone()
+    if not row:
+        return None
+    cached_at_str, result_json = row[1], row[0]
+    try:
+        cached_ts = datetime.fromisoformat(cached_at_str).timestamp()
+        age = time.time() - cached_ts
+        if age < settings.RESEARCH_CACHE_TTL:
+            import json
+            return json.loads(result_json)
+    except Exception:
+        pass
+    return None
+
+
+def set_research_cache(project_name: str, result: dict):
+    """Persist a research result to the DB cache."""
+    import json
+    with _conn() as con:
+        con.execute(
+            """INSERT INTO project_research_cache (project_name, result_json)
+               VALUES (?,?)
+               ON CONFLICT(project_name) DO UPDATE SET
+                   result_json=excluded.result_json,
+                   cached_at=datetime('now')""",
+            (project_name, json.dumps(result))
+        )
+
+
+# ── Standard CRUD ─────────────────────────────────────────────────────────
 
 def upsert_account(handle: str, name: str = "", tier: int = 2,
                    trusted: bool = False, notes: str = "") -> int:
@@ -103,8 +234,31 @@ def upsert_account(handle: str, name: str = "", tier: int = 2,
                 name=excluded.name, tier=excluded.tier,
                 trusted=excluded.trusted, notes=excluded.notes
         """, (handle, name, tier, int(trusted), notes))
-        row = con.execute("SELECT id FROM watched_accounts WHERE handle=?", (handle,)).fetchone()
+        row = con.execute(
+            "SELECT id FROM watched_accounts WHERE handle=?", (handle,)
+        ).fetchone()
         return row[0]
+
+
+def update_account_last_tweet(handle: str, tweet_id: str):
+    """Store the newest tweet_id seen for an account — enables since_id logic."""
+    with _conn() as con:
+        con.execute(
+            """UPDATE watched_accounts
+               SET last_tweet_id=?, last_checked=datetime('now')
+               WHERE handle=?""",
+            (tweet_id, handle)
+        )
+
+
+def get_account_last_tweet_id(handle: str) -> str | None:
+    """Retrieve the last seen tweet_id for a handle."""
+    with _conn() as con:
+        row = con.execute(
+            "SELECT last_tweet_id FROM watched_accounts WHERE handle=?",
+            (handle,)
+        ).fetchone()
+        return row[0] if row and row[0] else None
 
 
 def upsert_project(name: str, mentioned_by: str = "", tweet_url: str = "",
@@ -132,7 +286,9 @@ def upsert_project(name: str, mentioned_by: str = "", tweet_url: str = "",
             kwargs.get("github", ""),
             kwargs.get("description", ""),
         ))
-        row = con.execute("SELECT id FROM discovered_projects WHERE name=?", (name,)).fetchone()
+        row = con.execute(
+            "SELECT id FROM discovered_projects WHERE name=?", (name,)
+        ).fetchone()
         return row[0]
 
 
@@ -182,12 +338,12 @@ def get_all_projects():
     with _conn() as con:
         con.row_factory = sqlite3.Row
         return con.execute("""
-            SELECT p.*, 
+            SELECT p.*,
                    s.score, s.label, s.breakdown
             FROM discovered_projects p
             LEFT JOIN project_scores s ON s.id = (
-                SELECT id FROM project_scores 
-                WHERE project_id = p.id 
+                SELECT id FROM project_scores
+                WHERE project_id = p.id
                 ORDER BY scored_at DESC LIMIT 1
             )
             ORDER BY s.score DESC NULLS LAST
@@ -217,7 +373,7 @@ def add_grind_task(project_id: int, wallet_label: str, wallet_address: str,
                    task: str, due_date: str = "", notes: str = ""):
     with _conn() as con:
         con.execute("""
-            INSERT INTO grind_tracker 
+            INSERT INTO grind_tracker
                 (project_id, wallet_label, wallet_address, task, due_date, notes)
             VALUES (?,?,?,?,?,?)
         """, (project_id, wallet_label, wallet_address, task, due_date, notes))
@@ -226,7 +382,7 @@ def add_grind_task(project_id: int, wallet_label: str, wallet_address: str,
 def complete_task(task_id: int):
     with _conn() as con:
         con.execute("""
-            UPDATE grind_tracker 
+            UPDATE grind_tracker
             SET status='done', completed_at=datetime('now')
             WHERE id=?
         """, (task_id,))

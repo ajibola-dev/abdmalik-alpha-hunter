@@ -2,20 +2,29 @@
 modules/telegram_bot.py
 Telegram interface for Alpha Hunter.
 
+v0.2 fix:
+  - FIXED _cmd_suggestions(): broken import pattern removed.
+    Was: __import__('modules.database', fromlist=['_conn']).database._conn()
+    Now: direct import from modules.database (same as all other commands)
+
 Commands:
   /start          - Help menu
   /status         - Agent health + stats
   /topalpha       - Top 5 scored projects
   /newprojects    - Projects discovered in last 48h
-  /project <name> - Full details on a specific project
+  /project <n>    - Full details on a specific project
   /watchlist      - Show monitored X accounts
   /tasks          - Pending grind tasks
   /done <id>      - Mark task complete
   /research <url> - Research a tweet URL manually
+  /suggestions    - Pending account discoveries
+  /approve <h>    - Add discovered account
+  /reject <h>     - Dismiss suggestion
 """
 import logging
 import urllib.request
 import json
+import sqlite3
 import threading
 import time
 import re
@@ -33,7 +42,6 @@ def send_message(text: str, chat_id: str = None,
         logger.warning("TELEGRAM_BOT_TOKEN not set")
         return False
 
-    # Telegram max message length is 4096
     if len(text) > 4000:
         text = text[:3990] + "\n<i>...truncated</i>"
 
@@ -87,7 +95,10 @@ def _cmd_start(chat_id: str):
         "/tasks — Your pending grind tasks\n"
         "/done &lt;id&gt; — Mark task complete\n"
         "/status — Agent health\n"
-        "/research &lt;tweet_url&gt; — Research a tweet\n"        "/suggestions — Pending account discoveries\n"        "/approve &lt;handle&gt; — Add discovered account\n"        "/reject &lt;handle&gt; — Dismiss suggestion\n\n"
+        "/research &lt;tweet_url&gt; — Research a tweet\n"
+        "/suggestions — Pending account discoveries\n"
+        "/approve &lt;handle&gt; — Add discovered account\n"
+        "/reject &lt;handle&gt; — Dismiss suggestion\n\n"
         "<i>Or just forward any tweet URL and I'll research it instantly.</i>",
         chat_id=chat_id
     )
@@ -100,7 +111,8 @@ def _cmd_topalpha(chat_id: str):
     scored = sorted(scored, key=lambda x: x["score"] or 0, reverse=True)[:5]
 
     if not scored:
-        send_message("No high-scoring projects yet. Run a scan first.", chat_id=chat_id)
+        send_message("No high-scoring projects yet. Run a scan first.",
+                     chat_id=chat_id)
         return
 
     msg = "🏆 <b>Top Alpha Picks</b>\n\n"
@@ -115,7 +127,7 @@ def _cmd_topalpha(chat_id: str):
 def _cmd_newprojects(chat_id: str):
     from modules.database import _conn
     with _conn() as con:
-        con.row_factory = __import__('sqlite3').Row
+        con.row_factory = sqlite3.Row
         rows = con.execute("""
             SELECT p.*, s.score, s.label
             FROM discovered_projects p
@@ -128,7 +140,8 @@ def _cmd_newprojects(chat_id: str):
         """).fetchall()
 
     if not rows:
-        send_message("No new projects discovered in the last 48 hours.", chat_id=chat_id)
+        send_message("No new projects discovered in the last 48 hours.",
+                     chat_id=chat_id)
         return
 
     msg = f"🆕 <b>New Projects (Last 48h)</b> — {len(rows)} found\n\n"
@@ -140,7 +153,6 @@ def _cmd_newprojects(chat_id: str):
 
 def _cmd_project(chat_id: str, name: str):
     from modules.database import _conn
-    import sqlite3
     with _conn() as con:
         con.row_factory = sqlite3.Row
         row = con.execute("""
@@ -154,7 +166,10 @@ def _cmd_project(chat_id: str, name: str):
         """, (f"%{name}%",)).fetchone()
 
     if not row:
-        send_message(f"Project '{name}' not found. Try /newprojects to see what's tracked.", chat_id=chat_id)
+        send_message(
+            f"Project '{name}' not found. Try /newprojects to see what's tracked.",
+            chat_id=chat_id
+        )
         return
 
     funding = row["funding_usd"] or 0
@@ -187,7 +202,6 @@ def _cmd_project(chat_id: str, name: str):
 
 def _cmd_watchlist(chat_id: str):
     from modules.database import _conn
-    import sqlite3
     with _conn() as con:
         con.row_factory = sqlite3.Row
         rows = con.execute(
@@ -225,11 +239,13 @@ def _cmd_tasks(chat_id: str):
     tasks = get_grind_tasks()
     pending = [t for t in tasks if t["status"] == "pending"]
     if not pending:
-        send_message("✅ No pending tasks! You're all caught up.", chat_id=chat_id)
+        send_message("✅ No pending tasks! You're all caught up.",
+                     chat_id=chat_id)
         return
     msg = "📝 <b>Pending Grind Tasks</b>\n\n"
     for t in pending[:10]:
-        msg += f"[{t['id']}] <b>{t['project_name']}</b> ({t['wallet_label']})\n{t['task']}\n\n"
+        msg += (f"[{t['id']}] <b>{t['project_name']}</b> "
+                f"({t['wallet_label']})\n{t['task']}\n\n")
     send_message(msg, chat_id=chat_id)
 
 
@@ -239,7 +255,73 @@ def _cmd_done(chat_id: str, task_id: str):
         return
     from modules.database import complete_task
     complete_task(int(task_id))
-    send_message(f"✅ Task {task_id} marked complete! Keep grinding 💪", chat_id=chat_id)
+    send_message(f"✅ Task {task_id} marked complete! Keep grinding 💪",
+                 chat_id=chat_id)
+
+
+def _cmd_suggestions(chat_id: str):
+    """
+    v0.2 FIX: replaced broken __import__ chain with direct DB import.
+    The account_suggestions table is now created in init_db() so it always
+    exists — no need for ad-hoc CREATE TABLE here.
+    """
+    from modules.database import _conn
+    with _conn() as con:
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute("""
+                SELECT * FROM account_suggestions
+                WHERE status='pending'
+                ORDER BY score DESC
+            """).fetchall()
+        except Exception as exc:
+            logger.error("Suggestions query error: %s", exc)
+            send_message("No suggestions yet. Run a discovery cycle first.",
+                         chat_id=chat_id)
+            return
+
+    if not rows:
+        send_message("No pending suggestions right now.", chat_id=chat_id)
+        return
+
+    msg = f"🔍 <b>Pending Account Suggestions</b> ({len(rows)})\n\n"
+    for r in rows:
+        followers = r["followers"] or 0
+        msg += (
+            f"<b>@{r['handle']}</b> — {r['score']}/10 {r['label']}\n"
+            f"  Followers: {followers:,}\n"
+            f"  /approve {r['handle']}  |  /reject {r['handle']}\n\n"
+        )
+    send_message(msg, chat_id=chat_id)
+
+
+def _cmd_approve(chat_id: str, handle: str):
+    from modules.account_discovery import approve_suggestion
+    if not handle:
+        send_message("Usage: /approve <handle>", chat_id=chat_id)
+        return
+    success = approve_suggestion(handle)
+    if success:
+        send_message(
+            f"✅ <b>@{handle}</b> added to watchlist!\n"
+            f"They'll be monitored from the next scan cycle.",
+            chat_id=chat_id
+        )
+    else:
+        send_message(
+            f"❌ Could not add @{handle}. May already be in watchlist.",
+            chat_id=chat_id
+        )
+
+
+def _cmd_reject(chat_id: str, handle: str):
+    from modules.account_discovery import reject_suggestion
+    if not handle:
+        send_message("Usage: /reject <handle>", chat_id=chat_id)
+        return
+    reject_suggestion(handle)
+    send_message(f"❌ @{handle} rejected and won't be suggested again.",
+                 chat_id=chat_id)
 
 
 # ── Main command router ────────────────────────────────────────────────────
@@ -270,7 +352,8 @@ def _handle_message(text: str, chat_id: str, pipeline_callback=None):
             send_message("🔍 On it — researching that tweet...", chat_id=chat_id)
             pipeline_callback(tweet_url=urls[0], chat_id=chat_id)
         else:
-            send_message("Usage: /research https://twitter.com/...", chat_id=chat_id)
+            send_message("Usage: /research https://twitter.com/...",
+                         chat_id=chat_id)
     elif lower.startswith("/approve "):
         _cmd_approve(chat_id, text[9:].strip())
     elif lower.startswith("/reject "):
@@ -308,54 +391,3 @@ def start_polling(pipeline_callback=None):
     thread = threading.Thread(target=_poll, daemon=True)
     thread.start()
     return thread
-
-
-def _cmd_approve(chat_id: str, handle: str):
-    from modules.account_discovery import approve_suggestion
-    if not handle:
-        send_message("Usage: /approve <handle>", chat_id=chat_id)
-        return
-    success = approve_suggestion(handle)
-    if success:
-        send_message(
-            f"✅ <b>@{handle}</b> added to watchlist!\n"
-            f"They'll be monitored from the next scan cycle.",
-            chat_id=chat_id
-        )
-    else:
-        send_message(f"❌ Could not add @{handle}. May already be in watchlist.", chat_id=chat_id)
-
-
-def _cmd_reject(chat_id: str, handle: str):
-    from modules.account_discovery import reject_suggestion
-    if not handle:
-        send_message("Usage: /reject <handle>", chat_id=chat_id)
-        return
-    reject_suggestion(handle)
-    send_message(f"❌ @{handle} rejected and won't be suggested again.", chat_id=chat_id)
-
-
-def _cmd_suggestions(chat_id: str):
-    """Show all pending account suggestions."""
-    with __import__('modules.database', fromlist=['_conn']).database._conn() as con:
-        con.row_factory = __import__('sqlite3').Row
-        try:
-            rows = con.execute("""
-                SELECT * FROM account_suggestions
-                WHERE status='pending'
-                ORDER BY score DESC
-            """).fetchall()
-        except Exception:
-            send_message("No suggestions yet. Run a discovery cycle first.", chat_id=chat_id)
-            return
-
-    if not rows:
-        send_message("No pending suggestions right now.", chat_id=chat_id)
-        return
-
-    msg = f"🔍 <b>Pending Account Suggestions</b> ({len(rows)})\n\n"
-    for r in rows:
-        msg += (f"<b>@{r['handle']}</b> — {r['score']}/10 {r['label']}\n"
-                f"  Followers: {r['followers']:,}\n"
-                f"  /approve {r['handle']}  |  /reject {r['handle']}\n\n")
-    send_message(msg, chat_id=chat_id)

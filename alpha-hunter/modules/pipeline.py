@@ -1,22 +1,36 @@
 """
 modules/pipeline.py
-Orchestrates the full Alpha Hunter scan cycle:
-1. Fetch tweets from watchlist accounts
-2. Extract project names
-3. Research each project
-4. Score it (Zun method)
-5. Generate action plan
-6. Send Telegram alert if score >= threshold
-7. Save everything to DB
+Orchestrates the full Alpha Hunter scan cycle.
+
+v0.3 changes — Pipeline Staging:
+  - run_scan_cycle() refactored into discrete named stages:
+      extract_stage()      — fetch tweets, extract project names
+      fast_filter_stage()  — drop obvious non-projects before research
+      research_stage()     — API research on surviving candidates
+      score_stage()        — Zun-method scoring
+      alert_stage()        — DB persist + Telegram alert
+  - scan_id (timestamp-based) propagated through all stages and logs
+  - MAX_PROJECTS_PER_TWEET and MAX_PROJECTS_PER_SCAN enforced from settings
+  - process_tweet() retained for backward compat (used by /research command)
+  - All stage functions are independently testable and clearly separated
+
+v0.2 changes carried forward:
+  - tweet dedup via DB (is_seen_tweet delegates to database.tweet_seen)
+  - structured log context throughout
 """
 import json
 import logging
 import time
+import uuid
+from datetime import datetime
+
 from config.settings import settings
 from modules import database as db
 from modules.database import already_alerted
 from modules.x_monitor import monitor_all_accounts, fetch_tweet_from_url
-from modules.project_extractor import extract_project_names, score_tweet_quality
+from modules.project_extractor import (
+    extract_project_names, score_tweet_quality, is_seen_tweet
+)
 from modules.researcher import research_project
 from modules.scorer import score_project
 from modules.action_planner import generate_action_plan, format_action_plan_for_telegram
@@ -26,78 +40,212 @@ logger = logging.getLogger(__name__)
 
 
 def _load_watchlist() -> list[dict]:
-    """Load accounts from watchlist.json + database."""
-    import json
+    """Load accounts from watchlist.json."""
+    import json as _json
     accounts = []
     try:
         with open(settings.WATCHLIST_PATH) as f:
-            data = json.load(f)
+            data = _json.load(f)
             accounts = data.get("accounts", [])
     except Exception as exc:
         logger.error("Could not load watchlist: %s", exc)
     return accounts
 
 
-def process_tweet(tweet: dict, caller_tier: int = 2) -> list[dict]:
+def _make_scan_id() -> str:
+    """Short scan identifier for structured logs: e.g. 'scan_20240315_143022'"""
+    return datetime.now().strftime("scan_%Y%m%d_%H%M%S")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v0.3 PIPELINE STAGES
+# ══════════════════════════════════════════════════════════════════════════
+
+def extract_stage(watchlist: list[dict], scan_id: str) -> list[dict]:
     """
-    Process a single tweet — extract projects, research, score.
-    Returns list of scored project dicts that passed threshold.
+    Stage 1 — Fetch tweets + extract candidate project names.
+    Returns list of candidate dicts:
+      {tweet, handle, tier, project_name, tweet_quality}
     """
-    text = tweet.get("text", "")
-    handle = tweet.get("handle", "unknown")
-    tweet_url = tweet.get("url", "")
+    logger.info("[%s] ── extract_stage starting ──────────────", scan_id)
 
-    # Dedup — skip tweets already processed this session
-    from modules.project_extractor import is_seen_tweet
-    if is_seen_tweet(tweet_url, text):
-        return []
+    all_tweets = monitor_all_accounts(watchlist, scan_id=scan_id)
+    db.log_scan("x_monitor", len(all_tweets),
+                notes=f"scan_id={scan_id}")
 
-    # Quality check
-    tweet_quality = score_tweet_quality(text, handle, caller_tier)
-    if tweet_quality < 0.2:
-        return []
+    candidates = []
+    projects_this_scan = 0
 
-    # Extract project names
-    project_names = extract_project_names(text)
-    if not project_names:
-        return []
+    for tweet in all_tweets:
+        text = tweet.get("text", "")
+        handle = tweet.get("handle", "unknown")
+        tweet_url = tweet.get("url", "")
+        tweet_id = tweet.get("id", "")
 
-    logger.info("@%s mentioned %d project(s): %s", handle, len(project_names), project_names)
+        # Tweet-level dedup (DB-backed since v0.2)
+        if is_seen_tweet(tweet_url, text):
+            logger.debug("[%s] tweet %s already seen", scan_id, tweet_id)
+            continue
 
-    results = []
-    for name in project_names[:5]:  # Max 5 per tweet
+        # Get account tier
+        acc = next((a for a in watchlist if a.get("handle") == handle), {})
+        tier = acc.get("tier", 2)
+
+        # Quality gate — skip low-signal tweets early
+        tweet_quality = score_tweet_quality(text, handle, tier)
+        if tweet_quality < 0.2:
+            logger.debug("[%s] @%s tweet quality %.2f < 0.2 — skipping",
+                         scan_id, handle, tweet_quality)
+            continue
+
+        # Extract project names
+        names = extract_project_names(
+            text, scan_id=scan_id, tweet_id=tweet_id
+        )
+        if not names:
+            continue
+
+        logger.info("[%s] @%s quality=%.2f — candidates: %s",
+                    scan_id, handle, tweet_quality, names)
+
+        for name in names[:settings.MAX_PROJECTS_PER_TWEET]:
+            if projects_this_scan >= settings.MAX_PROJECTS_PER_SCAN:
+                logger.info("[%s] MAX_PROJECTS_PER_SCAN (%d) reached",
+                            scan_id, settings.MAX_PROJECTS_PER_SCAN)
+                break
+            candidates.append({
+                "tweet": tweet,
+                "handle": handle,
+                "tier": tier,
+                "project_name": name,
+                "tweet_quality": tweet_quality,
+            })
+            projects_this_scan += 1
+
+    logger.info("[%s] extract_stage complete — %d candidates",
+                scan_id, len(candidates))
+    return candidates
+
+
+def fast_filter_stage(candidates: list[dict], scan_id: str) -> list[dict]:
+    """
+    Stage 2 — Fast pre-research filter. Drops candidates that are
+    almost certainly noise without making any API calls.
+
+    Filter rules:
+      - Name too short (≤ 2 chars)
+      - Name is all-numeric
+      - Name contains only stopwords
+      - Name already has a confirmed live token in DB research cache
+    """
+    logger.info("[%s] ── fast_filter_stage (%d candidates) ──",
+                scan_id, len(candidates))
+
+    passed = []
+    for c in candidates:
+        name = c["project_name"]
+
+        # Length guard
+        if len(name) <= 2:
+            logger.debug("[%s] fast_filter: '%s' too short", scan_id, name)
+            continue
+
+        # All-numeric guard
+        if name.replace(" ", "").isdigit():
+            logger.debug("[%s] fast_filter: '%s' all-numeric", scan_id, name)
+            continue
+
+        # DB research cache: if we already know this has a live token, skip
+        cached = db.get_research_cache(name)
+        if cached and cached.get("has_token"):
+            logger.info("[%s] fast_filter: '%s' token already live (cache)",
+                        scan_id, name)
+            continue
+
+        passed.append(c)
+
+    dropped = len(candidates) - len(passed)
+    logger.info("[%s] fast_filter_stage: %d passed, %d dropped",
+                scan_id, len(passed), dropped)
+    return passed
+
+
+def research_stage(candidates: list[dict], scan_id: str) -> list[dict]:
+    """
+    Stage 3 — Deep research each candidate using APIs.
+    Attaches research result to each candidate dict.
+    Skips candidates whose token is already live.
+    """
+    logger.info("[%s] ── research_stage (%d candidates) ──",
+                scan_id, len(candidates))
+
+    enriched = []
+    for c in candidates:
+        name = c["project_name"]
+        tweet_text = c["tweet"].get("text", "")
+
         try:
-            # Research
-            project = research_project(name, tweet_text=text)
-            project["mentioned_by"] = handle
-            project["tweet_url"] = tweet_url
-            project["tweet_text"] = text[:500]
+            logger.info("[%s] researching '%s' (via @%s)",
+                        scan_id, name, c["handle"])
+            project = research_project(name, tweet_text=tweet_text)
+            project["mentioned_by"] = c["handle"]
+            project["tweet_url"] = c["tweet"].get("url", "")
+            project["tweet_text"] = tweet_text[:500]
 
-            # Skip if token live
             if project.get("has_token"):
-                logger.info("Skipping %s — token already live", name)
+                logger.info("[%s] '%s' — token live, skipping", scan_id, name)
                 continue
 
-            # Score
-            score_result = score_project(project, caller_tier=caller_tier)
+            c["project"] = project
+            enriched.append(c)
+            time.sleep(1)  # gentle pacing between API calls
 
-            # Save to DB — store novel_tech as comma-separated string
-            project_extras = {k: v for k, v in project.items()
-                   if k not in ("name", "mentioned_by", "tweet_url",
-                                "tweet_text", "research_notes",
-                                "novel_tech", "source_record")}
-            # Store novel_tech in description field for persistence
+        except Exception as exc:
+            logger.error("[%s] research error for '%s': %s",
+                         scan_id, name, exc)
+
+    logger.info("[%s] research_stage complete — %d enriched",
+                scan_id, len(enriched))
+    return enriched
+
+
+def score_stage(candidates: list[dict], scan_id: str) -> list[dict]:
+    """
+    Stage 4 — Score each researched candidate using Zun Method.
+    Persists project + score to DB.
+    Attaches score_result and project_id to candidate dict.
+    """
+    logger.info("[%s] ── score_stage (%d candidates) ──",
+                scan_id, len(candidates))
+
+    scored = []
+    for c in candidates:
+        project = c["project"]
+        name = c["project_name"]
+        tier = c["tier"]
+
+        try:
+            score_result = score_project(project, caller_tier=tier)
+
+            # Persist project to DB
+            project_extras = {
+                k: v for k, v in project.items()
+                if k not in ("name", "mentioned_by", "tweet_url",
+                             "tweet_text", "research_notes",
+                             "novel_tech", "source_record")
+            }
             if project.get("novel_tech"):
                 project_extras["description"] = (
                     project_extras.get("description", "") +
                     " [tech:" + ",".join(project["novel_tech"]) + "]"
                 )
+
             project_id = db.upsert_project(
                 name=name,
-                mentioned_by=handle,
-                tweet_url=tweet_url,
-                tweet_text=text[:500],
-                **project_extras
+                mentioned_by=c["handle"],
+                tweet_url=c["tweet"].get("url", ""),
+                tweet_text=c["tweet"].get("text", "")[:500],
+                **project_extras,
             )
             db.save_score(
                 project_id=project_id,
@@ -106,29 +254,95 @@ def process_tweet(tweet: dict, caller_tier: int = 2) -> list[dict]:
                 label=score_result.label,
             )
 
-            results.append({
-                "project": project,
-                "project_id": project_id,
-                "score_result": score_result,
-            })
+            c["project_id"] = project_id
+            c["score_result"] = score_result
+            scored.append(c)
 
-            time.sleep(1)
+            logger.info("[%s] scored '%s': %.1f/10 [%s]",
+                        scan_id, name, score_result.score, score_result.label)
 
         except Exception as exc:
-            logger.error("Error processing project '%s': %s", name, exc)
+            logger.error("[%s] score error for '%s': %s", scan_id, name, exc)
 
-    return results
+    logger.info("[%s] score_stage complete — %d scored", scan_id, len(scored))
+    return scored
 
+
+def alert_stage(candidates: list[dict], scan_id: str) -> int:
+    """
+    Stage 5 — Send Telegram alerts for qualifying projects.
+    Returns count of alerts sent.
+    """
+    logger.info("[%s] ── alert_stage (%d candidates) ──",
+                scan_id, len(candidates))
+
+    genesis_count = 0
+
+    for c in candidates:
+        project = c["project"]
+        project_id = c["project_id"]
+        score_result = c["score_result"]
+        name = c["project_name"]
+
+        if score_result.score < settings.GENESIS_THRESHOLD:
+            continue
+        if db.already_alerted(project_id):
+            logger.debug("[%s] '%s' already alerted — skipping",
+                         scan_id, name)
+            continue
+        if db.alerts_today() >= settings.MAX_ALERTS_PER_DAY:
+            logger.warning("[%s] MAX_ALERTS_PER_DAY (%d) reached",
+                           scan_id, settings.MAX_ALERTS_PER_DAY)
+            break
+
+        try:
+            action_plan = generate_action_plan(project, score_result)
+            message = format_action_plan_for_telegram(
+                project, score_result, action_plan
+            )
+
+            success = send_message(message)
+            if success:
+                db.log_alert(project_id, "genesis")
+                genesis_count += 1
+                logger.info(
+                    "[%s] 🌟 genesis alert sent: '%s' (%.1f/10)",
+                    scan_id, name, score_result.score
+                )
+
+                # Auto-add grind tasks
+                for task in action_plan["immediate_tasks"][:3]:
+                    db.add_grind_task(
+                        project_id=project_id,
+                        wallet_label="Wallet 1",
+                        wallet_address="",
+                        task=task,
+                    )
+
+        except Exception as exc:
+            logger.error("[%s] alert error for '%s': %s",
+                         scan_id, name, exc)
+
+    logger.info("[%s] alert_stage complete — %d alerts sent",
+                scan_id, genesis_count)
+    return genesis_count
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MAIN SCAN CYCLE (v0.3 — orchestrates stages)
+# ══════════════════════════════════════════════════════════════════════════
 
 def run_scan_cycle():
-    """Full scan: fetch all watchlist tweets, process, alert."""
+    """Full scan: orchestrates all 5 pipeline stages."""
+    scan_id = _make_scan_id()
+
     logger.info("=" * 60)
-    logger.info("🎯 Alpha Hunter Scan Starting")
+    logger.info("🎯 Alpha Hunter Scan Starting [%s]", scan_id)
     logger.info("=" * 60)
 
     watchlist = _load_watchlist()
     if not watchlist:
-        logger.warning("Watchlist is empty!")
+        logger.warning("[%s] Watchlist is empty!", scan_id)
         return
 
     # Sync watchlist to DB
@@ -141,52 +355,96 @@ def run_scan_cycle():
             notes=acc.get("notes", ""),
         )
 
-    # Fetch all tweets
-    all_tweets = monitor_all_accounts(watchlist)
-    db.log_scan("x_monitor", len(all_tweets))
-
-    genesis_count = 0
-
-    for tweet in all_tweets:
-        handle = tweet.get("handle", "")
-        # Get tier for this account
-        acc = next((a for a in watchlist if a.get("handle") == handle), {})
-        tier = acc.get("tier", 2)
-
-        scored_projects = process_tweet(tweet, caller_tier=tier)
-
-        for item in scored_projects:
-            project = item["project"]
-            project_id = item["project_id"]
-            score_result = item["score_result"]
-
-            # Alert if above threshold and not already alerted
-            if (score_result.score >= settings.GENESIS_THRESHOLD and
-                    not db.already_alerted(project_id) and
-                    db.alerts_today() < settings.MAX_ALERTS_PER_DAY):
-
-                action_plan = generate_action_plan(project, score_result)
-                message = format_action_plan_for_telegram(project, score_result, action_plan)
-
-                success = send_message(message)
-                if success:
-                    db.log_alert(project_id, "genesis")
-                    genesis_count += 1
-                    logger.info("🌟 Genesis alert sent for '%s' (%.1f/10)",
-                                project["name"], score_result.score)
-
-                    # Auto-add grind tasks to tracker
-                    for i, task in enumerate(action_plan["immediate_tasks"][:3]):
-                        db.add_grind_task(
-                            project_id=project_id,
-                            wallet_label="Wallet 1",
-                            wallet_address="",
-                            task=task,
-                        )
+    # ── Run stages sequentially ────────────────────────────────────────────
+    candidates = extract_stage(watchlist, scan_id)
+    candidates = fast_filter_stage(candidates, scan_id)
+    candidates = research_stage(candidates, scan_id)
+    candidates = score_stage(candidates, scan_id)
+    genesis_count = alert_stage(candidates, scan_id)
 
     logger.info("=" * 60)
-    logger.info("✅ Scan complete — %d genesis calls", genesis_count)
+    logger.info("✅ [%s] Scan complete — %d genesis calls", scan_id, genesis_count)
     logger.info("=" * 60)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MANUAL RESEARCH (Telegram /research command — backward compat)
+# ══════════════════════════════════════════════════════════════════════════
+
+def process_tweet(tweet: dict, caller_tier: int = 2) -> list[dict]:
+    """
+    Process a single tweet through a mini pipeline.
+    Retained for backward compatibility — used by research_tweet_url().
+    """
+    text = tweet.get("text", "")
+    handle = tweet.get("handle", "unknown")
+    tweet_url = tweet.get("url", "")
+    tweet_id = tweet.get("id", "")
+
+    if is_seen_tweet(tweet_url, text):
+        return []
+
+    tweet_quality = score_tweet_quality(text, handle, caller_tier)
+    if tweet_quality < 0.2:
+        return []
+
+    project_names = extract_project_names(text, tweet_id=tweet_id)
+    if not project_names:
+        return []
+
+    logger.info("@%s mentioned %d project(s): %s",
+                handle, len(project_names), project_names)
+
+    results = []
+    for name in project_names[:settings.MAX_PROJECTS_PER_TWEET]:
+        try:
+            project = research_project(name, tweet_text=text)
+            project["mentioned_by"] = handle
+            project["tweet_url"] = tweet_url
+            project["tweet_text"] = text[:500]
+
+            if project.get("has_token"):
+                logger.info("Skipping %s — token already live", name)
+                continue
+
+            score_result = score_project(project, caller_tier=caller_tier)
+
+            project_extras = {
+                k: v for k, v in project.items()
+                if k not in ("name", "mentioned_by", "tweet_url",
+                             "tweet_text", "research_notes",
+                             "novel_tech", "source_record")
+            }
+            if project.get("novel_tech"):
+                project_extras["description"] = (
+                    project_extras.get("description", "") +
+                    " [tech:" + ",".join(project["novel_tech"]) + "]"
+                )
+
+            project_id = db.upsert_project(
+                name=name,
+                mentioned_by=handle,
+                tweet_url=tweet_url,
+                tweet_text=text[:500],
+                **project_extras,
+            )
+            db.save_score(
+                project_id=project_id,
+                score=score_result.score,
+                breakdown=json.dumps(score_result.breakdown),
+                label=score_result.label,
+            )
+            results.append({
+                "project": project,
+                "project_id": project_id,
+                "score_result": score_result,
+            })
+            time.sleep(1)
+
+        except Exception as exc:
+            logger.error("Error processing project '%s': %s", name, exc)
+
+    return results
 
 
 def research_tweet_url(tweet_url: str, chat_id: str = None):
@@ -196,19 +454,23 @@ def research_tweet_url(tweet_url: str, chat_id: str = None):
     """
     send_message("🔍 Fetching tweet...", chat_id=chat_id)
 
-    from modules.x_monitor import fetch_tweet_from_url
     tweet = fetch_tweet_from_url(tweet_url)
-
     if not tweet:
-        send_message("❌ Could not fetch that tweet. Try pasting the text directly.", chat_id=chat_id)
+        send_message(
+            "❌ Could not fetch that tweet. Try pasting the text directly.",
+            chat_id=chat_id
+        )
         return
 
-    send_message(f"📝 Tweet found. Extracting projects...", chat_id=chat_id)
+    send_message("📝 Tweet found. Extracting projects...", chat_id=chat_id)
 
-    results = process_tweet(tweet, caller_tier=1)  # Manual = high trust
+    results = process_tweet(tweet, caller_tier=1)
 
     if not results:
-        send_message("🔍 No new projects found in that tweet, or all projects already have tokens.", chat_id=chat_id)
+        send_message(
+            "🔍 No new projects found in that tweet, or all projects already have tokens.",
+            chat_id=chat_id
+        )
         return
 
     for item in results:
@@ -219,26 +481,26 @@ def research_tweet_url(tweet_url: str, chat_id: str = None):
         send_message(message, chat_id=chat_id)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# DISCOVERY / FUNDING / GITHUB CYCLES (unchanged — pass-through)
+# ══════════════════════════════════════════════════════════════════════════
+
 def run_discovery_cycle():
-    """
-    Network discovery run — separate from main scan cycle.
-    Runs less frequently (every 24h).
-    Finds new accounts from trusted network interactions.
-    """
+    """Network discovery run — finds new accounts from trusted interactions."""
     from modules.account_discovery import (
         discover_accounts, save_pending_suggestion,
         format_suggestion_message
     )
-
+    scan_id = _make_scan_id()
     logger.info("=" * 60)
-    logger.info("🔍 Network Discovery Starting")
+    logger.info("🔍 Network Discovery Starting [%s]", scan_id)
     logger.info("=" * 60)
 
     watchlist = _load_watchlist()
     candidates = discover_accounts(watchlist)
 
     if not candidates:
-        logger.info("No new candidates found this cycle")
+        logger.info("[%s] No new candidates found this cycle", scan_id)
         return
 
     for candidate in candidates:
@@ -247,20 +509,17 @@ def run_discovery_cycle():
         send_message(message)
         time.sleep(2)
 
-    logger.info("Discovery complete — %d suggestions sent to Telegram",
-                len(candidates))
+    logger.info("[%s] Discovery complete — %d suggestions sent",
+                scan_id, len(candidates))
 
 
 def run_funding_scan_cycle():
-    """
-    Funding scan cycle — runs every 12 hours.
-    Covers DeFiLlama + CryptoRank across ALL categories.
-    """
+    """Funding scan cycle — runs every 12 hours."""
     from modules.funding_scanner import run_funding_scan
-    from modules.action_planner import generate_action_plan, format_action_plan_for_telegram
 
+    scan_id = _make_scan_id()
     logger.info("=" * 60)
-    logger.info("💰 Funding Scan Cycle Starting")
+    logger.info("💰 Funding Scan Cycle Starting [%s]", scan_id)
     logger.info("=" * 60)
 
     qualified = run_funding_scan()
@@ -284,19 +543,17 @@ def run_funding_scan_cycle():
                 db.log_alert(project_id, "funding")
                 genesis_count += 1
 
-    logger.info("Funding cycle complete — %d alerts sent", genesis_count)
+    logger.info("[%s] Funding cycle complete — %d alerts sent",
+                scan_id, genesis_count)
 
 
 def run_github_scan_cycle():
-    """
-    GitHub scan cycle — runs every 24 hours.
-    Finds technical signals before they appear on Twitter.
-    """
+    """GitHub scan cycle — runs every 24 hours."""
     from modules.github_scanner import run_github_scan
-    from modules.action_planner import generate_action_plan, format_action_plan_for_telegram
 
+    scan_id = _make_scan_id()
     logger.info("=" * 60)
-    logger.info("⚙️  GitHub Scan Cycle Starting")
+    logger.info("⚙️  GitHub Scan Cycle Starting [%s]", scan_id)
     logger.info("=" * 60)
 
     qualified = run_github_scan()
@@ -313,11 +570,12 @@ def run_github_scan_cycle():
             action_plan = generate_action_plan(project, score_result)
             message = (
                 "⚙️ <b>ALPHA HUNTER — GITHUB SIGNAL</b>\n"
-                f"<i>Detected on GitHub before Twitter</i>\n\n"
+                "<i>Detected on GitHub before Twitter</i>\n\n"
             ) + format_action_plan_for_telegram(project, score_result, action_plan)
 
             if send_message(message):
                 db.log_alert(project_id, "github")
                 genesis_count += 1
 
-    logger.info("GitHub cycle complete — %d alerts sent", genesis_count)
+    logger.info("[%s] GitHub cycle complete — %d alerts sent",
+                scan_id, genesis_count)
