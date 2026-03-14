@@ -449,7 +449,10 @@ def _cmd_debug(chat_id: str):
         if sample_projects:
             result += f"     Sample projects: {', '.join(sample_projects[:5])}\n"
         else:
-            result += f"     ⚠️ No projects extracted from any tweet\n"
+            result += f"     ⚠️ No projects extracted — showing raw tweets:\n"
+            for i, t in enumerate(tweets[:3], 1):
+                preview = t["text"][:200].replace("<","&lt;").replace(">","&gt;")
+                result += f"\n     [{i}] {preview}\n"
 
         send_message(result, chat_id=chat_id)
 
