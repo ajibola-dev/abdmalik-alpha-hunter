@@ -196,6 +196,14 @@ def research_stage(candidates: list[dict], scan_id: str) -> list[dict]:
 
             if project.get("has_token"):
                 logger.info("[%s] '%s' — token live, skipping", scan_id, name)
+                # Still persist to DB so /newprojects shows it as token-live
+                db.upsert_project(
+                    name=name,
+                    mentioned_by=c["handle"],
+                    tweet_url=c["tweet"].get("url", ""),
+                    tweet_text=c["tweet"].get("text", "")[:500],
+                    has_token=True,
+                )
                 continue
 
             c["project"] = project

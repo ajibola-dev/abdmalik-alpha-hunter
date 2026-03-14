@@ -458,17 +458,36 @@ def _cmd_debug(chat_id: str):
 
     # ── 3. DB summary ─────────────────────────────────────────────────────
     with _conn() as con:
+        con.row_factory = sqlite3.Row
         tweets_seen = con.execute("SELECT COUNT(*) FROM tweet_seen").fetchone()[0]
         projects = con.execute("SELECT COUNT(*) FROM discovered_projects").fetchone()[0]
         scores = con.execute("SELECT COUNT(*) FROM project_scores").fetchone()[0]
+        token_live = con.execute(
+            "SELECT COUNT(*) FROM discovered_projects WHERE has_token=1"
+        ).fetchone()[0]
+        recent = con.execute("""
+            SELECT p.name, p.has_token, p.mentioned_by, s.score, s.label
+            FROM discovered_projects p
+            LEFT JOIN project_scores s ON s.id = (
+                SELECT id FROM project_scores WHERE project_id=p.id
+                ORDER BY scored_at DESC LIMIT 1
+            )
+            ORDER BY p.discovered_at DESC LIMIT 8
+        """).fetchall()
 
-    send_message(
+    db_msg = (
         f"🗄️ <b>Database</b>\n"
         f"  Tweets seen (dedup): {tweets_seen}\n"
-        f"  Projects stored: {projects}\n"
-        f"  Scores recorded: {scores}",
-        chat_id=chat_id
+        f"  Projects stored: {projects} ({token_live} token-live, skipped)\n"
+        f"  Scores recorded: {scores}\n"
     )
+    if recent:
+        db_msg += "\n<b>Recent projects:</b>\n"
+        for r in recent:
+            status = "❌ token live" if r["has_token"] else f"{r['score'] or '?'}/10"
+            db_msg += f"  • {r['name']} — {status} via @{r['mentioned_by'] or '?'}\n"
+
+    send_message(db_msg, chat_id=chat_id)
 
 
 # ── Main command router ────────────────────────────────────────────────────

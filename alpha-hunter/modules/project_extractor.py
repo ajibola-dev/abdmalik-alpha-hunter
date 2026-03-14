@@ -27,6 +27,7 @@ from modules import database as db
 logger = logging.getLogger(__name__)
 
 _ALPHA_SIGNALS = [
+    # Original signals
     "going deep on", "been building on", "grinding",
     "testnet", "airdrop", "been using", "conviction",
     "positioning", "early on", "been on", "no token yet",
@@ -35,6 +36,21 @@ _ALPHA_SIGNALS = [
     "watching", "next big", "underrated", "hidden gem",
     "sleep on", "don't sleep", "contribute",
     "participation", "eligibility",
+    # v0.6.3: real alpha caller vocabulary (from /debug output)
+    "raised", "seed round", "series a", "series b",
+    "ambassador", "backed by", "funded by", "just raised",
+    "raised $", "raised a", "launch", "launching",
+    "mainnet", "live on", "just launched", "just went live",
+    "alpha", "gem", "narrative", "positioning",
+    "opportunity", "undervalued", "low cap", "low mcap",
+    "no token", "tokenless", "pre-launch", "pre launch",
+    "whitelist", "allowlist", "points program",
+    "incentivized", "incentivised", "rewards",
+    "ecosystem", "grant", "galxe", "layer3", "zealy",
+    "built on", "deploying on", "migrating to",
+    "deep dive", "thread", "alpha thread", "research",
+    "robotics", "depin", "restaking", "modular",
+    "infrastructure", "protocol", "l1", "l2",
 ]
 
 # Comprehensive noise word list — real-world crypto tweet vocabulary
@@ -84,6 +100,14 @@ _NOISE_WORDS = {
     # Countries / regions (often capitalised)
     "america", "europe", "asia", "africa", "china", "india",
     "korea", "japan", "russia", "france", "germany", "brazil",
+    # Seen as false extractions in /debug output
+    "airdropped", "contrary", "hype", "lit", "privy",
+    "unlike", "instead", "however", "therefore", "because",
+    "president", "trump", "congress", "senate", "white", "house",
+    "women", "international", "recognition", "honor", "privilege",
+    "upcoming", "adventure", "ancient", "forgotten", "mystery",
+    "library", "prompts", "grandma", "expert", "leading", "simply",
+    "coming", "wanna", "matches", "tee", "info",
 }
 
 
@@ -167,6 +191,23 @@ def extract_project_names(tweet_text: str,
         for word in cap_words:
             if len(word) > 3 and word.lower() not in _NOISE_WORDS:
                 candidates.append(word)
+
+    # ── Priority 6: Lowercase project names near funding/launch signals ───
+    # Catches "bitrobot raised $8m", "somerepo just launched" etc.
+    # Only runs when other passes found nothing — avoids noise explosion.
+    if not candidates:
+        funding_patterns = [
+            r'(?:raised?|funded|backed)\s+(?:\$[\d\.]+[mk]?\s+)?(?:in\s+)?(?:a\s+)?(?:seed|series\s+[ab]|pre-?seed)?\s*(?:round\s+(?:to|for)\s+build)?\s+(?:by\s+)?([a-z][a-z0-9]{2,20})',
+            r'(?:ambassador|partnered|building)\s+(?:for|with)\s+([a-z][a-z0-9]{2,20})',
+            r'([a-z][a-z0-9]{2,20})\s+(?:raised|launched|mainnet|testnet|airdrop)',
+            r'check\s+out\s+([a-z][a-z0-9]{2,20})',
+            r'(?:alpha|gem|play|bet)\s+(?:on|is)\s+([a-z][a-z0-9]{2,20})',
+        ]
+        for pattern in funding_patterns:
+            for match in re.findall(pattern, tweet_text.lower()):
+                if (len(match) > 3 and match not in _NOISE_WORDS
+                        and not match.isdigit()):
+                    candidates.append(match)
 
     # ── Deduplicate and clean ─────────────────────────────────────────────
     seen = set()
