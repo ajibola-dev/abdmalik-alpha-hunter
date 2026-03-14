@@ -129,6 +129,17 @@ def extract_stage(watchlist: list[dict], scan_id: str) -> list[dict]:
     return candidates
 
 
+# Known live tokens — never research these, saves CoinGecko calls
+_KNOWN_LIVE_TOKENS = {
+    "bitcoin", "ethereum", "solana", "polygon", "avalanche", "base",
+    "opensea", "polymarket", "coinbase", "zora", "uniswap", "aave",
+    "chainlink", "arbitrum", "optimism", "blur", "dydx", "gmx",
+    "hyperliquid", "jupiter", "raydium", "orca", "drift", "jito",
+    "wormhole", "layerzero", "eigenlayer", "lido", "rocket pool",
+    "pendle", "ethena", "ondo", "usual", "sky", "maker", "compound",
+}
+
+
 def fast_filter_stage(candidates: list[dict], scan_id: str) -> list[dict]:
     """
     Stage 2 — Fast pre-research filter. Drops candidates that are
@@ -137,7 +148,7 @@ def fast_filter_stage(candidates: list[dict], scan_id: str) -> list[dict]:
     Filter rules:
       - Name too short (≤ 2 chars)
       - Name is all-numeric
-      - Name contains only stopwords
+      - Known live token (blocklist — saves CoinGecko calls)
       - Name already has a confirmed live token in DB research cache
     """
     logger.info("[%s] ── fast_filter_stage (%d candidates) ──",
@@ -146,6 +157,7 @@ def fast_filter_stage(candidates: list[dict], scan_id: str) -> list[dict]:
     passed = []
     for c in candidates:
         name = c["project_name"]
+        name_lower = name.lower().strip()
 
         # Length guard
         if len(name) <= 2:
@@ -155,6 +167,11 @@ def fast_filter_stage(candidates: list[dict], scan_id: str) -> list[dict]:
         # All-numeric guard
         if name.replace(" ", "").isdigit():
             logger.debug("[%s] fast_filter: '%s' all-numeric", scan_id, name)
+            continue
+
+        # Known live token blocklist — skip CoinGecko entirely
+        if name_lower in _KNOWN_LIVE_TOKENS:
+            logger.debug("[%s] fast_filter: '%s' known live token", scan_id, name)
             continue
 
         # DB research cache: if we already know this has a live token, skip

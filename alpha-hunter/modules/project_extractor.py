@@ -108,6 +108,17 @@ _NOISE_WORDS = {
     "upcoming", "adventure", "ancient", "forgotten", "mystery",
     "library", "prompts", "grandma", "expert", "leading", "simply",
     "coming", "wanna", "matches", "tee", "info",
+    # Seen in Railway logs as false extractions
+    "potential", "send", "sell", "hodl", "crazy", "contributor",
+    "launched", "pivoting", "absolute", "breaking", "projected",
+    "seize", "control", "chambers", "november", "surviving",
+    "faction", "journey", "reuniting", "rebuild", "fate",
+    "opensea", "polymarket", "coinbase", "zora", "base",
+    "polygon", "dime", "miled", "privacy", "users",
+    # Generic action/state words
+    "migrated", "deployed", "shipped", "released", "updated",
+    "announced", "confirmed", "revealed", "reported", "shared",
+    "posted", "replied", "retweeted", "liked", "followed",
 }
 
 
@@ -205,7 +216,8 @@ def extract_project_names(tweet_text: str,
         ]
         for pattern in funding_patterns:
             for match in re.findall(pattern, tweet_text.lower()):
-                if (len(match) > 3 and match not in _NOISE_WORDS
+                # Require 5+ chars for lowercase matches — filters "base","send" etc
+                if (len(match) >= 5 and match not in _NOISE_WORDS
                         and not match.isdigit()):
                     candidates.append(match)
 

@@ -45,7 +45,8 @@ except ImportError:
 # ── Shared DeFiLlama cache (loaded once, shared by all coroutines) ─────────
 _defillama_cache: list = []
 _defillama_cache_time: float = 0
-_defillama_lock: Optional[asyncio.Lock] = None  # created lazily inside event loop
+_defillama_lock: Optional[asyncio.Lock] = None      # created lazily inside event loop
+_coingecko_semaphore: Optional[asyncio.Semaphore] = None  # serialises CoinGecko calls
 
 
 def _get_defillama_lock():
@@ -53,6 +54,18 @@ def _get_defillama_lock():
     if _defillama_lock is None:
         _defillama_lock = asyncio.Lock()
     return _defillama_lock
+
+
+def _get_coingecko_semaphore():
+    """
+    CoinGecko free tier allows ~10-30 req/min.
+    We serialise with limit=1 and a post-request sleep to stay safe.
+    This prevents the rate-limit storm seen in Railway logs.
+    """
+    global _coingecko_semaphore
+    if _coingecko_semaphore is None:
+        _coingecko_semaphore = asyncio.Semaphore(1)
+    return _coingecko_semaphore
 
 
 # ── Async HTTP helper ──────────────────────────────────────────────────────
@@ -179,12 +192,19 @@ def _search_defillama_cache(project_name: str) -> dict:
 
 async def _check_token_live_async(
         session: "aiohttp.ClientSession", project_name: str) -> bool:
+    """
+    CoinGecko token check — serialised via dedicated semaphore.
+    v0.6.4: only 1 CoinGecko request runs at a time across all coroutines,
+    with a 2s sleep after each call. Eliminates the rate-limit storm.
+    """
     import json
-    data = await _async_get(
-        session,
-        "https://api.coingecko.com/api/v3/search",
-        params={"query": project_name},
-    )
+    async with _get_coingecko_semaphore():
+        data = await _async_get(
+            session,
+            "https://api.coingecko.com/api/v3/search",
+            params={"query": project_name},
+        )
+        await asyncio.sleep(2)  # 2s between CoinGecko calls — ~30 req/min max
     if not data:
         return False
     try:
