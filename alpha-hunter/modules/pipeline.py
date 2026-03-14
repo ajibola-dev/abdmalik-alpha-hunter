@@ -87,9 +87,10 @@ def extract_stage(watchlist: list[dict], scan_id: str) -> list[dict]:
             logger.debug("[%s] tweet %s already seen", scan_id, tweet_id)
             continue
 
-        # Get account tier
+        # Get account tier + weight (v0.6: weight enables fractional tier-1)
         acc = next((a for a in watchlist if a.get("handle") == handle), {})
         tier = acc.get("tier", 2)
+        weight = float(acc.get("weight", 1.0))
 
         # Quality gate — skip low-signal tweets early
         tweet_quality = score_tweet_quality(text, handle, tier)
@@ -117,6 +118,7 @@ def extract_stage(watchlist: list[dict], scan_id: str) -> list[dict]:
                 "tweet": tweet,
                 "handle": handle,
                 "tier": tier,
+                "weight": weight,
                 "project_name": name,
                 "tweet_quality": tweet_quality,
             })
@@ -225,7 +227,11 @@ def score_stage(candidates: list[dict], scan_id: str) -> list[dict]:
         tier = c["tier"]
 
         try:
-            score_result = score_project(project, caller_tier=tier)
+            score_result = score_project(
+                project,
+                caller_tier=tier,
+                caller_weight=c.get("weight", 1.0),
+            )
 
             # Persist project to DB
             project_extras = {
@@ -366,12 +372,20 @@ def run_scan_cycle():
     logger.info("✅ [%s] Scan complete — %d genesis calls", scan_id, genesis_count)
     logger.info("=" * 60)
 
+    # Notify watchdog that scan completed successfully
+    try:
+        from modules.watchdog import record_heartbeat
+        record_heartbeat()
+    except Exception:
+        pass  # watchdog is optional — never let it break the pipeline
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # MANUAL RESEARCH (Telegram /research command — backward compat)
 # ══════════════════════════════════════════════════════════════════════════
 
-def process_tweet(tweet: dict, caller_tier: int = 2) -> list[dict]:
+def process_tweet(tweet: dict, caller_tier: int = 2,
+                  caller_weight: float = 1.0) -> list[dict]:
     """
     Process a single tweet through a mini pipeline.
     Retained for backward compatibility — used by research_tweet_url().
@@ -407,7 +421,11 @@ def process_tweet(tweet: dict, caller_tier: int = 2) -> list[dict]:
                 logger.info("Skipping %s — token already live", name)
                 continue
 
-            score_result = score_project(project, caller_tier=caller_tier)
+            score_result = score_project(
+                project,
+                caller_tier=caller_tier,
+                caller_weight=caller_weight,
+            )
 
             project_extras = {
                 k: v for k, v in project.items()
@@ -484,6 +502,81 @@ def research_tweet_url(tweet_url: str, chat_id: str = None):
 # ══════════════════════════════════════════════════════════════════════════
 # DISCOVERY / FUNDING / GITHUB CYCLES (unchanged — pass-through)
 # ══════════════════════════════════════════════════════════════════════════
+
+
+def run_backfill_cycle(max_tweets: int = 50):
+    """
+    Historical backfill — processes the last N tweets from every watchlist
+    account through the full pipeline.
+
+    Use this when:
+      - You just added a new account to the watchlist
+      - Alpha Hunter was offline and you missed recent posts
+      - You want to catch projects mentioned before this bot was running
+
+    Called via: python main.py --backfill [--backfill-count N]
+    """
+    from modules.x_monitor import backfill_all_accounts
+
+    scan_id = _make_scan_id()
+    logger.info("=" * 60)
+    logger.info("⏮️  Backfill Starting [%s] (last %d tweets per account)",
+                scan_id, max_tweets)
+    logger.info("=" * 60)
+
+    watchlist = _load_watchlist()
+    if not watchlist:
+        logger.warning("[%s] Watchlist is empty!", scan_id)
+        return
+
+    for acc in watchlist:
+        db.upsert_account(
+            handle=acc.get("handle", ""),
+            name=acc.get("name", ""),
+            tier=acc.get("tier", 2),
+            trusted=acc.get("trusted", False),
+            notes=acc.get("notes", ""),
+        )
+
+    # Fetch historical tweets (bypasses since_id)
+    all_tweets = backfill_all_accounts(
+        watchlist, max_tweets=max_tweets, scan_id=scan_id
+    )
+
+    if not all_tweets:
+        logger.info("[%s] Backfill: no new historical tweets found", scan_id)
+        return
+
+    logger.info("[%s] Backfill: %d historical tweets to process", scan_id, len(all_tweets))
+
+    # Build candidates with tier+weight
+    candidates = []
+    for tweet in all_tweets:
+        handle = tweet.get("handle", "")
+        acc = next((a for a in watchlist if a.get("handle") == handle), {})
+        tier = acc.get("tier", 2)
+        weight = float(acc.get("weight", 1.0))
+        tweet_quality = score_tweet_quality(tweet.get("text", ""), handle, tier)
+        if tweet_quality < 0.2:
+            continue
+        names = extract_project_names(
+            tweet.get("text", ""), scan_id=scan_id, tweet_id=tweet.get("id", "")
+        )
+        for name in names[:settings.MAX_PROJECTS_PER_TWEET]:
+            candidates.append({
+                "tweet": tweet, "handle": handle,
+                "tier": tier, "weight": weight,
+                "project_name": name, "tweet_quality": tweet_quality,
+            })
+
+    candidates = fast_filter_stage(candidates, scan_id)
+    candidates = research_stage(candidates, scan_id)
+    candidates = score_stage(candidates, scan_id)
+    genesis_count = alert_stage(candidates, scan_id)
+
+    logger.info("=" * 60)
+    logger.info("✅ [%s] Backfill complete — %d genesis calls", scan_id, genesis_count)
+    logger.info("=" * 60)
 
 def run_discovery_cycle():
     """Network discovery run — finds new accounts from trusted interactions."""

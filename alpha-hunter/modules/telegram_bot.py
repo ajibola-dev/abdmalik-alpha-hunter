@@ -96,6 +96,7 @@ def _cmd_start(chat_id: str):
         "/done &lt;id&gt; — Mark task complete\n"
         "/status — Agent health\n"
         "/research &lt;tweet_url&gt; — Research a tweet\n"
+        "/backfill [N] — Scan last N tweets per account (default 50)\n"
         "/suggestions — Pending account discoveries\n"
         "/approve &lt;handle&gt; — Add discovered account\n"
         "/reject &lt;handle&gt; — Dismiss suggestion\n\n"
@@ -214,8 +215,17 @@ def _cmd_watchlist(chat_id: str):
 
     msg = "👀 <b>Monitored Accounts</b>\n\n"
     for r in rows:
-        tier_str = "⭐ Tier 1" if r["tier"] == 1 else "Tier 2"
-        msg += f"@{r['handle']} — {tier_str}\n<i>{r['notes'] or ''}</i>\n\n"
+        if r["tier"] == 1:
+            tier_str = "⭐ Tier 1"
+        else:
+            tier_str = "Tier 2"
+        handle = r["handle"]
+        twitter_url = f"https://twitter.com/{handle}"
+        msg += (
+            f"<b>{r['name'] or handle}</b> — {tier_str}\n"
+            f"<a href='{twitter_url}'>@{handle} on X/Twitter</a>\n"
+            f"<i>{r['notes'] or ''}</i>\n\n"
+        )
     send_message(msg, chat_id=chat_id)
 
 
@@ -324,6 +334,22 @@ def _cmd_reject(chat_id: str, handle: str):
                  chat_id=chat_id)
 
 
+def _cmd_backfill(chat_id: str, count: int = 50):
+    """Trigger historical backfill from Telegram."""
+    send_message(
+        f"⏮️ Starting backfill — last {count} tweets per account.\n"
+        f"This may take several minutes...",
+        chat_id=chat_id
+    )
+    import threading
+    def _run():
+        from modules.pipeline import run_backfill_cycle
+        run_backfill_cycle(max_tweets=count)
+        send_message("✅ Backfill complete! Use /newprojects to see results.",
+                     chat_id=chat_id)
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ── Main command router ────────────────────────────────────────────────────
 
 def _handle_message(text: str, chat_id: str, pipeline_callback=None):
@@ -360,6 +386,10 @@ def _handle_message(text: str, chat_id: str, pipeline_callback=None):
         _cmd_reject(chat_id, text[8:].strip())
     elif lower.startswith("/suggestions"):
         _cmd_suggestions(chat_id)
+    elif lower.startswith("/backfill"):
+        parts = text.split()
+        count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50
+        _cmd_backfill(chat_id, count)
     else:
         send_message(
             "Unknown command. Type /start to see all commands.",

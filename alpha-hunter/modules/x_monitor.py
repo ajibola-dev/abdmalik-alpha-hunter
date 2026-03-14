@@ -267,3 +267,84 @@ def monitor_all_accounts(watchlist: list[dict],
     logger.info("[scan=%s] Total new tweets: %d from %d accounts",
                 scan_id, len(all_tweets), len(watchlist))
     return all_tweets
+
+
+def backfill_account(handle: str, max_tweets: int = 50,
+                     scan_id: str = "") -> list[dict]:
+    """
+    Fetch the last N tweets from a single account, bypassing since_id.
+    Used for historical backfill — catches projects mentioned before
+    Alpha Hunter was monitoring this account.
+
+    Unlike fetch_recent_tweets(), this:
+      - Ignores since_id (fetches regardless of what's been seen before)
+      - Respects tweet_seen DB (won't duplicate-process already-seen tweets)
+      - Fetches up to max_tweets (default 50, capped at 100 by API)
+    """
+    log_ctx = f"[backfill scan={scan_id}] @{handle}"
+    logger.info("%s fetching last %d tweets", log_ctx, max_tweets)
+
+    user_id = get_user_id(handle)
+    if not user_id:
+        return []
+
+    # Deliberately omit since_id — we want historical tweets
+    params = {"user": user_id, "count": str(min(max_tweets, 100))}
+    data = _get(f"{_API_BASE}/user-tweets", params=params)
+    if not data:
+        return []
+
+    tweets = []
+    try:
+        instructions = (data.get("result", {})
+                            .get("timeline", {})
+                            .get("instructions", []))
+        for instruction in instructions:
+            for entry in instruction.get("entries", []):
+                legacy = (entry.get("content", {})
+                              .get("itemContent", {})
+                              .get("tweet_results", {})
+                              .get("result", {})
+                              .get("legacy", {}))
+                tweet_id = legacy.get("id_str", "")
+                text = legacy.get("full_text", "")
+                if not tweet_id or not text or text.startswith("RT @"):
+                    continue
+
+                # Still respect DB dedup — don't reprocess known tweets
+                t_hash = _tweet_hash(tweet_id, handle)
+                if db.is_tweet_seen(t_hash):
+                    continue
+                db.mark_tweet_seen(t_hash, tweet_id=tweet_id, handle=handle)
+
+                tweets.append({
+                    "handle": handle,
+                    "text": text,
+                    "url": f"https://twitter.com/{handle}/status/{tweet_id}",
+                    "id": tweet_id,
+                    "date": legacy.get("created_at", ""),
+                })
+    except Exception as exc:
+        logger.warning("%s parse error: %s", log_ctx, exc)
+
+    logger.info("%s backfill complete — %d tweets retrieved",
+                log_ctx, len(tweets))
+    return tweets
+
+
+def backfill_all_accounts(watchlist: list[dict],
+                           max_tweets: int = 50,
+                           scan_id: str = "") -> list[dict]:
+    """Backfill historical tweets from all watchlist accounts."""
+    all_tweets = []
+    for account in watchlist:
+        handle = account.get("handle", "")
+        if not handle:
+            continue
+        tweets = backfill_account(handle, max_tweets=max_tweets,
+                                  scan_id=scan_id)
+        all_tweets.extend(tweets)
+        time.sleep(3)
+    logger.info("[%s] Backfill complete — %d total tweets from %d accounts",
+                scan_id, len(all_tweets), len(watchlist))
+    return all_tweets
