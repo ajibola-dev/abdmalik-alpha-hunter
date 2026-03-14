@@ -97,6 +97,7 @@ def _cmd_start(chat_id: str):
         "/status — Agent health\n"
         "/research &lt;tweet_url&gt; — Research a tweet\n"
         "/backfill [N] — Scan last N tweets per account (default 50)\n"
+        "/debug — Diagnose pipeline (tweet fetch, quality gate, extraction)\n"
         "/suggestions — Pending account discoveries\n"
         "/approve &lt;handle&gt; — Add discovered account\n"
         "/reject &lt;handle&gt; — Dismiss suggestion\n\n"
@@ -350,6 +351,123 @@ def _cmd_backfill(chat_id: str, count: int = 50):
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _cmd_debug(chat_id: str):
+    """
+    Diagnostic command — shows exactly what the pipeline sees.
+    Reports: watchlist accounts, tweet fetch counts, quality gate results,
+    extraction results. Helps diagnose silent failures without reading logs.
+    """
+    from modules.x_monitor import get_user_id, fetch_recent_tweets
+    from modules.project_extractor import (
+        _is_alpha_tweet, score_tweet_quality, extract_project_names
+    )
+    from modules.database import _conn
+    import sqlite3
+
+    send_message("🔬 Running diagnostics...", chat_id=chat_id)
+
+    # ── 1. Watchlist status ───────────────────────────────────────────────
+    from config.settings import settings
+    import json
+    try:
+        with open(settings.WATCHLIST_PATH) as f:
+            wl = json.load(f)
+        accounts = wl.get("accounts", [])
+    except Exception as exc:
+        send_message(f"❌ Could not load watchlist: {exc}", chat_id=chat_id)
+        return
+
+    msg = f"📋 <b>Watchlist</b>: {len(accounts)} accounts\n"
+    for a in accounts:
+        msg += f"  @{a['handle']} tier={a['tier']} weight={a.get('weight',1.0)}\n"
+    send_message(msg, chat_id=chat_id)
+
+    # ── 2. Per-account tweet fetch + quality gate ─────────────────────────
+    for account in accounts:
+        handle = account["handle"]
+        tier = account.get("tier", 2)
+
+        send_message(f"🔍 Checking @{handle}...", chat_id=chat_id)
+
+        # Resolve user_id
+        uid = get_user_id(handle)
+        if not uid:
+            send_message(f"  ❌ @{handle}: could not resolve user_id — check RAPIDAPI_KEY", chat_id=chat_id)
+            continue
+
+        # Fetch tweets (uses since_id — may return 0 if all seen)
+        tweets = fetch_recent_tweets(handle, max_results=10)
+
+        if not tweets:
+            # Check DB for last seen tweet
+            with _conn() as con:
+                con.row_factory = sqlite3.Row
+                row = con.execute(
+                    "SELECT last_tweet_id, last_checked FROM watched_accounts WHERE handle=?",
+                    (handle,)
+                ).fetchone()
+            if row and row["last_tweet_id"]:
+                send_message(
+                    f"  ℹ️ @{handle}: 0 new tweets (since_id={row['last_tweet_id'][:8]}... "
+                    f"last checked {(row['last_checked'] or 'never')[:16]})",
+                    chat_id=chat_id
+                )
+            else:
+                send_message(
+                    f"  ⚠️ @{handle}: 0 tweets returned and no since_id recorded — "
+                    f"API may have returned empty or user_id is wrong",
+                    chat_id=chat_id
+                )
+            continue
+
+        # Quality gate breakdown
+        passed_quality = 0
+        passed_alpha = 0
+        extracted_any = 0
+        sample_projects = []
+
+        for t in tweets:
+            text = t["text"]
+            quality = score_tweet_quality(text, handle, tier)
+            is_alpha = _is_alpha_tweet(text)
+
+            if quality >= 0.2:
+                passed_quality += 1
+            if is_alpha:
+                passed_alpha += 1
+                names = extract_project_names(text)
+                if names:
+                    extracted_any += 1
+                    sample_projects.extend(names[:3])
+
+        result = (
+            f"  ✅ @{handle}: {len(tweets)} tweets fetched\n"
+            f"     Quality ≥0.2: {passed_quality}/{len(tweets)}\n"
+            f"     Alpha signal: {passed_alpha}/{len(tweets)}\n"
+            f"     Had extractions: {extracted_any}/{len(tweets)}\n"
+        )
+        if sample_projects:
+            result += f"     Sample projects: {', '.join(sample_projects[:5])}\n"
+        else:
+            result += f"     ⚠️ No projects extracted from any tweet\n"
+
+        send_message(result, chat_id=chat_id)
+
+    # ── 3. DB summary ─────────────────────────────────────────────────────
+    with _conn() as con:
+        tweets_seen = con.execute("SELECT COUNT(*) FROM tweet_seen").fetchone()[0]
+        projects = con.execute("SELECT COUNT(*) FROM discovered_projects").fetchone()[0]
+        scores = con.execute("SELECT COUNT(*) FROM project_scores").fetchone()[0]
+
+    send_message(
+        f"🗄️ <b>Database</b>\n"
+        f"  Tweets seen (dedup): {tweets_seen}\n"
+        f"  Projects stored: {projects}\n"
+        f"  Scores recorded: {scores}",
+        chat_id=chat_id
+    )
+
+
 # ── Main command router ────────────────────────────────────────────────────
 
 def _handle_message(text: str, chat_id: str, pipeline_callback=None):
@@ -386,6 +504,8 @@ def _handle_message(text: str, chat_id: str, pipeline_callback=None):
         _cmd_reject(chat_id, text[8:].strip())
     elif lower.startswith("/suggestions"):
         _cmd_suggestions(chat_id)
+    elif lower.startswith("/debug"):
+        _cmd_debug(chat_id)
     elif lower.startswith("/backfill"):
         parts = text.split()
         count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50
