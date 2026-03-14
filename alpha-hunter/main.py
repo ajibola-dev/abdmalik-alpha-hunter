@@ -50,6 +50,10 @@ def main():
     parser.add_argument("--research", type=str, metavar="TWEET_URL")
     parser.add_argument("--reset-db", action="store_true")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--backfill", action="store_true",
+                        help="Process last N tweets from all watchlist accounts")
+    parser.add_argument("--backfill-count", type=int, default=50,
+                        metavar="N", help="Tweets to backfill per account (default 50)")
     args = parser.parse_args()
 
     if args.reset_db:
@@ -72,6 +76,14 @@ def main():
         research_tweet_url(args.research)
         return
 
+    if args.backfill:
+        logger.info("Running historical backfill (%d tweets per account)...",
+                    args.backfill_count)
+        from modules.pipeline import run_backfill_cycle
+        run_backfill_cycle(max_tweets=args.backfill_count)
+        print_status()
+        return
+
     if args.scan_once:
         logger.info("Running single scan...")
         from modules.pipeline import run_scan_cycle
@@ -84,6 +96,10 @@ def main():
     from modules.pipeline import research_tweet_url
     from modules.telegram_bot import start_polling
     from modules.scheduler import start_all_schedulers
+
+    # Start watchdog health monitor in background
+    from modules.watchdog import start_watchdog
+    start_watchdog()
 
     # Start Telegram polling in background
     start_polling(pipeline_callback=lambda tweet_url, chat_id:
