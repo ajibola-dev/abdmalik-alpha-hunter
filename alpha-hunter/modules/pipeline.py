@@ -522,7 +522,7 @@ def run_funding_scan_cycle():
     logger.info("💰 Funding Scan Cycle Starting [%s]", scan_id)
     logger.info("=" * 60)
 
-    qualified = run_funding_scan()
+    qualified = run_funding_scan(scan_id=scan_id)
     genesis_count = 0
 
     for item in qualified:
@@ -556,7 +556,7 @@ def run_github_scan_cycle():
     logger.info("⚙️  GitHub Scan Cycle Starting [%s]", scan_id)
     logger.info("=" * 60)
 
-    qualified = run_github_scan()
+    qualified = run_github_scan(scan_id=scan_id)
     genesis_count = 0
 
     for item in qualified:
