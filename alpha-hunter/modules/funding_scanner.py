@@ -311,20 +311,32 @@ def run_funding_scan(scan_id: str = "") -> list[dict]:
     unique = list(seen.values())
     logger.info("[%s] Funding scan: %d unique candidates", scan_id, len(unique))
 
+    # Pre-score using cached data only (no API calls) to cut candidates
+    # before expensive CoinGecko checks. Projects with no VC, no funding,
+    # and no novel tech will never score above threshold regardless of token status.
+    PRE_SCORE_MIN = 2.0  # Below this even a top VC caller wouldn't push it above 5
+
     results = []
+    skipped_pre = 0
     for project in unique:
         name = project["name"]
         try:
+            # Quick pre-score with no API calls
+            desc = project.get("description", "")
+            project["novel_tech"] = _detect_novel_tech(desc)
+            project["testnet_active"] = _detect_testnet(desc)
+            pre_score = score_project(project, caller_tier=2, caller_count=1)
+
+            if pre_score.score < PRE_SCORE_MIN:
+                skipped_pre += 1
+                continue
+
             time.sleep(1.5)
 
             if not verify_no_token(name, scan_id=scan_id):
                 continue
 
-            desc = project.get("description", "")
-            project["novel_tech"] = _detect_novel_tech(desc)
-            project["testnet_active"] = _detect_testnet(desc)
-
-            score_result = score_project(project, caller_tier=2, caller_count=1)
+            score_result = pre_score  # Already scored above — reuse
 
             logger.info(
                 "[%s] funding scored project='%s' score=%.1f label='%s'",
@@ -368,8 +380,10 @@ def run_funding_scan(scan_id: str = "") -> list[dict]:
     ]
 
     logger.info(
-        "[%s] Funding scan complete — total=%d qualified=%d (threshold=%d)",
-        scan_id, len(results), len(qualified), settings.GENESIS_THRESHOLD
+        "[%s] Funding scan complete — total=%d qualified=%d "
+        "(pre-filtered=%d threshold=%.1f)",
+        scan_id, len(results), len(qualified),
+        skipped_pre, settings.GENESIS_THRESHOLD
     )
     log_scan("funding_scanner", len(qualified), notes=f"scan_id={scan_id}")
     return qualified

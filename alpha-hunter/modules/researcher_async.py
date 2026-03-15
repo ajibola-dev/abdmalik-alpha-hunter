@@ -46,26 +46,21 @@ except ImportError:
 _defillama_cache: list = []
 _defillama_cache_time: float = 0
 _defillama_lock: Optional[asyncio.Lock] = None      # created lazily inside event loop
-_coingecko_semaphore: Optional[asyncio.Semaphore] = None  # serialises CoinGecko calls
+# NOTE: _coingecko_semaphore removed — was bound to first event loop and crashed
+# on subsequent asyncio.run() calls. Semaphore now created fresh per research batch
+# and passed explicitly to each coroutine. See research_projects_async().
 
 
 def _get_defillama_lock():
-    global _defillama_lock
-    if _defillama_lock is None:
-        _defillama_lock = asyncio.Lock()
-    return _defillama_lock
+    """
+    Returns a fresh asyncio.Lock each time — avoids event loop binding errors.
+    DeFiLlama cache is protected by a module-level Python threading lock instead,
+    which is safe across event loops.
+    """
+    return asyncio.Lock()
 
 
-def _get_coingecko_semaphore():
-    """
-    CoinGecko free tier allows ~10-30 req/min.
-    We serialise with limit=1 and a post-request sleep to stay safe.
-    This prevents the rate-limit storm seen in Railway logs.
-    """
-    global _coingecko_semaphore
-    if _coingecko_semaphore is None:
-        _coingecko_semaphore = asyncio.Semaphore(1)
-    return _coingecko_semaphore
+# _get_coingecko_semaphore() removed — see note above
 
 
 # ── Async HTTP helper ──────────────────────────────────────────────────────
@@ -191,14 +186,17 @@ def _search_defillama_cache(project_name: str) -> dict:
 # ── Per-project async research coroutines ─────────────────────────────────
 
 async def _check_token_live_async(
-        session: "aiohttp.ClientSession", project_name: str) -> bool:
+        session: "aiohttp.ClientSession",
+        project_name: str,
+        coingecko_sem: asyncio.Semaphore = None) -> bool:
     """
-    CoinGecko token check — serialised via dedicated semaphore.
-    v0.6.4: only 1 CoinGecko request runs at a time across all coroutines,
-    with a 2s sleep after each call. Eliminates the rate-limit storm.
+    CoinGecko token check — serialised via semaphore passed from caller.
+    v0.7.1: semaphore is created fresh per research batch in research_projects_async()
+    to avoid event loop binding errors across multiple asyncio.run() calls.
     """
     import json
-    async with _get_coingecko_semaphore():
+    sem = coingecko_sem or asyncio.Semaphore(1)
+    async with sem:
         data = await _async_get(
             session,
             "https://api.coingecko.com/api/v3/search",
@@ -305,10 +303,12 @@ async def _research_one(
         semaphore: asyncio.Semaphore,
         session: "aiohttp.ClientSession",
         project_name: str,
-        tweet_text: str = "") -> dict:
+        tweet_text: str = "",
+        coingecko_sem: asyncio.Semaphore = None) -> dict:
     """
     Research a single project — all API calls run concurrently.
-    Respects global semaphore to cap concurrent requests.
+    semaphore: caps total concurrent research coroutines.
+    coingecko_sem: dedicated semaphore for CoinGecko — created fresh per batch.
     """
     async with semaphore:
         # DB cache check (sync — fast)
@@ -336,8 +336,10 @@ async def _research_one(
         # Ensure DeFiLlama is loaded (shared, only fetches once)
         await _ensure_defillama_cache(session)
 
-        # Token check — must be done first; if live, skip everything else
-        has_token = await _check_token_live_async(session, project_name)
+        # Token check — uses the per-batch CoinGecko semaphore
+        has_token = await _check_token_live_async(
+            session, project_name, coingecko_sem=coingecko_sem
+        )
         result["has_token"] = has_token
         if has_token:
             result["research_notes"].append("⚠️ Token already live on CoinGecko")
@@ -410,7 +412,9 @@ async def research_projects_async(candidates: list[dict]) -> list[dict]:
         )
         return []
 
+    # Create semaphores fresh inside this event loop — never reuse across loops
     semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS)
+    coingecko_sem = asyncio.Semaphore(1)  # Serialise CoinGecko — 1 at a time
     timeout = aiohttp.ClientTimeout(total=settings.REQUEST_TIMEOUT)
 
     async with aiohttp.ClientSession(
@@ -422,6 +426,7 @@ async def research_projects_async(candidates: list[dict]) -> list[dict]:
                 semaphore, session,
                 c["project_name"],
                 c["tweet"].get("text", ""),
+                coingecko_sem=coingecko_sem,
             )
             for c in candidates
         ]
