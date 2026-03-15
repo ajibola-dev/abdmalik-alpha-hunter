@@ -28,7 +28,10 @@ class Settings:
     RAPIDAPI_KEY: str = os.getenv("RAPIDAPI_KEY", "")
 
     # ── Scoring thresholds ─────────────────────────────────────────────────
-    GENESIS_THRESHOLD: int = int(os.getenv("GENESIS_THRESHOLD", "7"))
+    # v0.7: lowered default from 7 to 5 to catch "WATCHING" tier (5.0-6.9)
+    # miden scored 5.5 and was never alerted — this fixes that.
+    # Set GENESIS_THRESHOLD=7 in Railway env vars to restore strict mode.
+    GENESIS_THRESHOLD: float = float(os.getenv("GENESIS_THRESHOLD", "5"))
     MAX_ALERTS_PER_DAY: int = int(os.getenv("MAX_ALERTS_PER_DAY", "10"))
 
     # ── Scheduler ─────────────────────────────────────────────────────────
