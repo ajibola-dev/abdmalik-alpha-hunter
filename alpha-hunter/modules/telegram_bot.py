@@ -97,7 +97,7 @@ def _cmd_start(chat_id: str):
         "/wallets — Wallet summary with progress bars\n"
         "/addwallet &lt;project&gt; &lt;label&gt; &lt;task&gt; — Add task to specific wallet\n"
         "/status — Agent health\n"
-        "/research &lt;tweet_url&gt; — Research a tweet\n"
+        "/research &lt;url or text&gt; — Research a tweet URL or paste text\n"
         "/backfill [N] — Scan last N tweets per account (default 50)\n"
         "/debug — Diagnose pipeline (tweet fetch, quality gate, extraction)\n"
         "/suggestions — Pending account discoveries\n"
@@ -611,6 +611,37 @@ def _cmd_debug(chat_id: str):
     send_message(db_msg, chat_id=chat_id)
 
 
+def _research_pasted_text(chat_id: str, text: str, pipeline_callback=None):
+    """
+    v0.7.2: Research pasted tweet text directly — no URL needed.
+    Called when user pastes tweet text into the chat.
+    """
+    import threading
+    def _run():
+        try:
+            from modules.x_monitor import research_text_directly
+            from modules.pipeline import process_tweet
+            tweet = research_text_directly(text)
+            results = process_tweet(tweet, caller_tier=1)
+            if not results:
+                send_message(
+                    "🔍 No alpha projects detected in that text.\n"
+                    "Make sure it contains project names, funding info, or testnet signals.",
+                    chat_id=chat_id
+                )
+                return
+            for item in results:
+                project = item["project"]
+                score_result = item["score_result"]
+                from modules.action_planner import generate_action_plan, format_action_plan_for_telegram
+                action_plan = generate_action_plan(project, score_result)
+                message = format_action_plan_for_telegram(project, score_result, action_plan)
+                send_message(message, chat_id=chat_id)
+        except Exception as exc:
+            send_message(f"❌ Research error: {exc}", chat_id=chat_id)
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ── Main command router ────────────────────────────────────────────────────
 
 def _handle_message(text: str, chat_id: str, pipeline_callback=None):
@@ -644,9 +675,21 @@ def _handle_message(text: str, chat_id: str, pipeline_callback=None):
         if urls and pipeline_callback:
             send_message("🔍 On it — researching that tweet...", chat_id=chat_id)
             pipeline_callback(tweet_url=urls[0], chat_id=chat_id)
+        elif lower.startswith("/research "):
+            # User typed /research but no URL detected — maybe pasted text after
+            raw_text = text[10:].strip()
+            if len(raw_text) > 20:
+                send_message("🔍 Researching pasted text...", chat_id=chat_id)
+                _research_pasted_text(chat_id, raw_text, pipeline_callback)
+            else:
+                send_message(
+                    "Usage:\n"
+                    "/research https://twitter.com/...\n\n"
+                    "Or: /research <paste tweet text here>",
+                    chat_id=chat_id
+                )
         else:
-            send_message("Usage: /research https://twitter.com/...",
-                         chat_id=chat_id)
+            send_message("Usage: /research https://twitter.com/...", chat_id=chat_id)
     elif lower.startswith("/approve "):
         _cmd_approve(chat_id, text[9:].strip())
     elif lower.startswith("/reject "):
@@ -659,6 +702,11 @@ def _handle_message(text: str, chat_id: str, pipeline_callback=None):
         parts = text.split()
         count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50
         _cmd_backfill(chat_id, count)
+    elif len(text) > 30 and not text.startswith("/"):
+        # Long text that's not a command — treat as pasted tweet text
+        send_message("🔍 Treating as pasted tweet text — researching...",
+                     chat_id=chat_id)
+        _research_pasted_text(chat_id, text, pipeline_callback)
     else:
         send_message(
             "Unknown command. Type /start to see all commands.",

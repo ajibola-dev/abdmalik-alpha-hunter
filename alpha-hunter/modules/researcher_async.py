@@ -1,25 +1,17 @@
 """
 modules/researcher_async.py
-Async research pipeline — v0.4
+Async research pipeline — v0.7.2
 
-Replaces the blocking researcher.py HTTP calls with aiohttp + asyncio
-for the research_stage() in pipeline.py.
-
-Key improvements over sync researcher.py:
-  - All API calls (CoinGecko, GitHub, DeFiLlama, website scrape) run
-    concurrently per project using asyncio.gather()
-  - asyncio.Semaphore(CONCURRENT_REQUESTS) prevents hammering APIs
-  - Timeout enforced via aiohttp.ClientTimeout (settings.REQUEST_TIMEOUT)
-  - Content size cap enforced at stream level (MAX_SCRAPE_BYTES)
-  - DB research cache (get/set_research_cache) used identically to sync version
-  - DeFiLlama dataset fetched once at startup, shared across all coroutines
-  - Falls back gracefully — if aiohttp unavailable, pipeline_async.py
-    imports sync researcher.py instead
-
-Usage (pipeline_async.py calls this):
-    results = await research_projects_async(candidates)
-
-Each result is a full project dict identical in shape to research_project().
+v0.7.2 changes:
+  - FIXED: Event loop semaphore binding crash.
+    _coingecko_semaphore was a module-level singleton bound to the first
+    asyncio event loop. Each asyncio.run() call creates a new event loop,
+    causing "bound to a different event loop" error on every scan after the
+    first. Fix: semaphores now created fresh inside research_projects_async()
+    and passed explicitly to each coroutine. Never stored at module level.
+  - Tech detection updated to match researcher.py v0.7.2 (_TECH_SIGNAL_MAP)
+  - GitHub topics now included in tech detection
+  - DeFiLlama lock also fixed (returns fresh lock each call)
 """
 import asyncio
 import logging
@@ -31,50 +23,31 @@ from modules import database as db
 
 logger = logging.getLogger(__name__)
 
-# ── Lazy import of aiohttp ─────────────────────────────────────────────────
 try:
     import aiohttp
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
-    logger.warning(
-        "aiohttp not installed — async researcher unavailable. "
-        "Install with: pip install aiohttp"
-    )
+    logger.warning("aiohttp not installed — async researcher unavailable.")
 
-# ── Shared DeFiLlama cache (loaded once, shared by all coroutines) ─────────
+# ── DeFiLlama cache (module-level is fine — just data, not event loop objects)
 _defillama_cache: list = []
 _defillama_cache_time: float = 0
-_defillama_lock: Optional[asyncio.Lock] = None      # created lazily inside event loop
-# NOTE: _coingecko_semaphore removed — was bound to first event loop and crashed
-# on subsequent asyncio.run() calls. Semaphore now created fresh per research batch
-# and passed explicitly to each coroutine. See research_projects_async().
+# Threading lock for cache update — safe across event loops
+import threading
+_defillama_thread_lock = threading.Lock()
 
 
 def _get_defillama_lock():
-    """
-    Returns a fresh asyncio.Lock each time — avoids event loop binding errors.
-    DeFiLlama cache is protected by a module-level Python threading lock instead,
-    which is safe across event loops.
-    """
+    """Returns a fresh asyncio.Lock each call — avoids event loop binding."""
     return asyncio.Lock()
 
-
-# _get_coingecko_semaphore() removed — see note above
-
-
-# ── Async HTTP helper ──────────────────────────────────────────────────────
 
 async def _async_get(session: "aiohttp.ClientSession",
                      url: str,
                      params: dict = None,
                      extra_headers: dict = None,
                      max_bytes: int = None) -> Optional[bytes]:
-    """
-    Single async GET with exponential backoff.
-    Returns raw bytes or None on failure.
-    max_bytes: if set, stream is cut off at this size (website scrape cap).
-    """
     headers = {}
     if extra_headers:
         headers.update(extra_headers)
@@ -82,27 +55,18 @@ async def _async_get(session: "aiohttp.ClientSession",
     for attempt in range(settings.MAX_RETRIES):
         try:
             async with session.get(
-                url,
-                params=params,
+                url, params=params,
                 headers=headers or None,
                 allow_redirects=True,
             ) as resp:
                 if resp.status == 429:
                     wait = 60 * (attempt + 1)
-                    logger.warning(
-                        "Rate limited on %s — sleeping %ds", url, wait
-                    )
+                    logger.warning("Rate limited on %s — sleeping %ds", url, wait)
                     await asyncio.sleep(wait)
                     continue
                 if resp.status >= 400:
-                    logger.debug(
-                        "HTTP %d on %s (attempt %d)",
-                        resp.status, url, attempt + 1
-                    )
                     return None
-
                 if max_bytes:
-                    # Stream with size cap
                     chunks = []
                     total = 0
                     async for chunk in resp.content.iter_chunked(8192):
@@ -113,44 +77,35 @@ async def _async_get(session: "aiohttp.ClientSession",
                     return b"".join(chunks)
                 else:
                     return await resp.read()
-
         except Exception as exc:
             wait = settings.RETRY_BACKOFF_BASE ** attempt
             if attempt < settings.MAX_RETRIES - 1:
-                logger.debug(
-                    "Async GET %s failed (attempt %d): %s — retry in %ds",
-                    url, attempt + 1, exc, wait
-                )
                 await asyncio.sleep(wait)
             else:
-                logger.debug("Async GET %s failed after %d attempts: %s",
-                             url, settings.MAX_RETRIES, exc)
+                logger.debug("Async GET %s failed: %s", url, exc)
     return None
 
 
-# ── DeFiLlama (loaded once, shared) ───────────────────────────────────────
-
 async def _ensure_defillama_cache(session: "aiohttp.ClientSession"):
-    """Load DeFiLlama raises into shared cache if stale. Thread-safe via lock."""
+    """Load DeFiLlama cache if stale. Uses fresh asyncio.Lock per call."""
     global _defillama_cache, _defillama_cache_time
-
     age = time.time() - _defillama_cache_time
     if _defillama_cache and age < settings.DEFILLAMA_CACHE_TTL:
         return
 
+    # Use a fresh lock — safe across event loops
     async with _get_defillama_lock():
-        # Double-check after acquiring lock
         age = time.time() - _defillama_cache_time
         if _defillama_cache and age < settings.DEFILLAMA_CACHE_TTL:
             return
-
         logger.info("Fetching DeFiLlama raises (async, one-time)...")
         data = await _async_get(session, "https://api.llama.fi/raises")
         if data:
             import json
             try:
-                _defillama_cache = json.loads(data).get("raises", [])
-                _defillama_cache_time = time.time()
+                with _defillama_thread_lock:
+                    _defillama_cache = json.loads(data).get("raises", [])
+                    _defillama_cache_time = time.time()
                 logger.info("DeFiLlama async cache: %d records",
                             len(_defillama_cache))
             except Exception as exc:
@@ -158,17 +113,17 @@ async def _ensure_defillama_cache(session: "aiohttp.ClientSession"):
 
 
 def _search_defillama_cache(project_name: str) -> dict:
-    """Search the in-memory DeFiLlama cache. Called after _ensure_defillama_cache."""
     name_lower = project_name.lower()
     best = None
-    for r in _defillama_cache:
+    with _defillama_thread_lock:
+        cache = list(_defillama_cache)
+    for r in cache:
         rn = str(r.get("name", "")).lower()
         if rn == name_lower or name_lower in rn.split():
             best = r
             break
         if name_lower in rn and best is None:
             best = r
-
     if not best:
         return {}
     amount = best.get("amount", 0) or 0
@@ -183,16 +138,13 @@ def _search_defillama_cache(project_name: str) -> dict:
     }
 
 
-# ── Per-project async research coroutines ─────────────────────────────────
-
 async def _check_token_live_async(
         session: "aiohttp.ClientSession",
         project_name: str,
         coingecko_sem: asyncio.Semaphore = None) -> bool:
     """
-    CoinGecko token check — serialised via semaphore passed from caller.
-    v0.7.1: semaphore is created fresh per research batch in research_projects_async()
-    to avoid event loop binding errors across multiple asyncio.run() calls.
+    v0.7.2: semaphore passed from caller, not from module level.
+    Eliminates event loop binding crash.
     """
     import json
     sem = coingecko_sem or asyncio.Semaphore(1)
@@ -202,7 +154,7 @@ async def _check_token_live_async(
             "https://api.coingecko.com/api/v3/search",
             params={"query": project_name},
         )
-        await asyncio.sleep(2)  # 2s between CoinGecko calls — ~30 req/min max
+        await asyncio.sleep(2)
     if not data:
         return False
     try:
@@ -237,7 +189,6 @@ async def _search_github_async(
         items = json.loads(data).get("items", [])
         if items:
             from datetime import datetime, timezone
-
             def _rank(r):
                 stars = r.get("stargazers_count", 0)
                 updated = r.get("updated_at", "")
@@ -248,13 +199,13 @@ async def _search_github_async(
                     days_old = 999
                 recency_bonus = max(0, 180 - days_old) / 180
                 return stars * (0.7 + 0.3 * recency_bonus)
-
             best = max(items, key=_rank)
             return {
                 "github_url": best.get("html_url", ""),
                 "stars": best.get("stargazers_count", 0),
                 "last_commit": best.get("updated_at", ""),
-                "description": best.get("description", ""),
+                "description": best.get("description", "") or "",
+                "topics": best.get("topics", []),
             }
     except Exception:
         pass
@@ -282,22 +233,75 @@ async def _scrape_website_async(
         return ""
 
 
+# ── Tech detection (mirrors researcher.py v0.7.2) ─────────────────────────
+
+_TECH_SIGNAL_MAP = {
+    "fhe": "fhe", "fully homomorphic": "fhe",
+    "zero knowledge": "zero knowledge", "zk proof": "zero knowledge",
+    "zkvm": "zero knowledge", "zkp": "zero knowledge",
+    "zk rollup": "zero knowledge", "zk-rollup": "zero knowledge",
+    "zk-evm": "zero knowledge", "zkevm": "zero knowledge",
+    "privacy": "privacy", "mpc": "privacy",
+    "depin": "depin", "decentralized physical": "depin",
+    "wireless": "depin", "iot": "depin", "hardware": "depin",
+    "node operator": "depin", "validator": "depin",
+    "ai blockchain": "ai blockchain", "on-chain ai": "ai blockchain",
+    "autonomous agent": "ai blockchain", "ai agent": "ai blockchain",
+    "machine learning": "ai blockchain", "inference": "ai blockchain",
+    "restaking": "restaking", "shared security": "restaking",
+    "avs": "restaking", "eigenlayer": "restaking",
+    "modular": "modular", "data availability": "modular",
+    "rollup": "modular",
+    "intent based": "intent based",
+    "account abstraction": "account abstraction",
+    "social graph": "social graph", "ai social": "social graph",
+    "real world asset": "rwa", "rwa": "rwa", "tokenized": "rwa",
+    "payments": "payments", "stablecoin": "payments",
+    "layer 1": "layer 1", "l1 blockchain": "layer 1",
+    "layer 2": "layer 2", "l2": "layer 2",
+}
+
+
 def _detect_novel_tech(text: str) -> list[str]:
-    found, lower = [], text.lower()
+    found = {}
+    lower = text.lower()
+    for signal, canonical in _TECH_SIGNAL_MAP.items():
+        if signal in lower and canonical not in found:
+            found[canonical] = True
     for signal in settings.NOVEL_TECH_SIGNALS:
-        if signal in lower:
-            found.append(signal)
-    return found
+        if signal in lower and signal not in found:
+            found[signal] = True
+    return list(found.keys())
 
 
 def _detect_testnet(text: str) -> bool:
     signals = ["testnet", "devnet", "join our network", "run a node",
-                "validator", "node operator", "public testnet"]
+                "validator", "node operator", "public testnet",
+                "incentivized testnet", "testnet is live", "testnet launch"]
     lower = text.lower()
     return any(s in lower for s in signals)
 
 
-# ── Single project research coroutine ─────────────────────────────────────
+def _detect_category(text: str) -> str:
+    lower = text.lower()
+    if any(x in lower for x in ["fhe", "fully homomorphic"]):
+        return "FHE"
+    if any(x in lower for x in ["zero knowledge", "zkvm", "zkp", "zk proof"]):
+        return "ZK/Privacy"
+    if any(x in lower for x in ["depin", "decentralized physical", "iot"]):
+        return "DePIN"
+    if any(x in lower for x in ["restaking", "shared security", "avs"]):
+        return "Restaking"
+    if any(x in lower for x in ["modular", "data availability"]):
+        return "Modular"
+    if any(x in lower for x in ["ai agent", "on-chain ai", "ai blockchain"]):
+        return "AI/ML"
+    if any(x in lower for x in ["layer 1", "l1 blockchain"]):
+        return "Layer 1"
+    if any(x in lower for x in ["layer 2", "l2", "rollup"]):
+        return "Layer 2"
+    return "Infrastructure"
+
 
 async def _research_one(
         semaphore: asyncio.Semaphore,
@@ -306,19 +310,17 @@ async def _research_one(
         tweet_text: str = "",
         coingecko_sem: asyncio.Semaphore = None) -> dict:
     """
-    Research a single project — all API calls run concurrently.
-    semaphore: caps total concurrent research coroutines.
-    coingecko_sem: dedicated semaphore for CoinGecko — created fresh per batch.
+    Research a single project concurrently.
+    v0.7.2: coingecko_sem passed from caller (fresh per batch).
+    Tech detection uses combined tweet + github + website text.
     """
     async with semaphore:
-        # DB cache check (sync — fast)
         cached = db.get_research_cache(project_name)
         if cached:
             logger.debug("Async DB cache hit: %s", project_name)
             return cached
 
         logger.info("Async researching: %s", project_name)
-
         result = {
             "name": project_name,
             "funding_usd": 0,
@@ -333,10 +335,9 @@ async def _research_one(
             "research_notes": [],
         }
 
-        # Ensure DeFiLlama is loaded (shared, only fetches once)
         await _ensure_defillama_cache(session)
 
-        # Token check — uses the per-batch CoinGecko semaphore
+        # Token check with fresh per-batch semaphore
         has_token = await _check_token_live_async(
             session, project_name, coingecko_sem=coingecko_sem
         )
@@ -346,15 +347,15 @@ async def _research_one(
             db.set_research_cache(project_name, result)
             return result
 
-        # DeFiLlama lookup (sync, uses in-memory cache)
+        # DeFiLlama (sync cache lookup)
         funding_data = _search_defillama_cache(project_name)
         if funding_data:
             result.update(funding_data)
             result["research_notes"].append(
-                f"💰 DeFiLlama: ${funding_data.get('funding_usd', 0)/1e6:.0f}M raised"
+                f"💰 DeFiLlama: ${funding_data.get('funding_usd', 0)/1e6:.1f}M raised"
             )
 
-        # GitHub + website scrape — run concurrently
+        # GitHub + website concurrently
         website = result.get("website", "")
         gh_task = asyncio.create_task(
             _search_github_async(session, project_name)
@@ -362,59 +363,47 @@ async def _research_one(
         web_task = asyncio.create_task(
             _scrape_website_async(session, website)
         )
-
         gh, page_text = await asyncio.gather(gh_task, web_task)
 
+        gh_text = ""
         if gh:
             result["github"] = gh.get("github_url", "")
+            gh_text = gh.get("description", "") + " " + " ".join(gh.get("topics", []))
             result["research_notes"].append(
                 f"⚙️ GitHub: {gh.get('stars', 0)}★ "
                 f"updated {gh.get('last_commit','')[:10]}"
             )
+            if not result.get("description") and gh_text.strip():
+                result["description"] = gh_text.strip()[:300]
 
-        if page_text:
-            combined = page_text + " " + tweet_text
-            novel = _detect_novel_tech(combined)
-            result["novel_tech"] = novel
-            if novel:
-                result["research_notes"].append(
-                    f"🔬 Novel tech: {', '.join(novel)}"
-                )
-            if _detect_testnet(page_text):
-                result["testnet_active"] = True
-                result["research_notes"].append("🧪 Testnet on website")
+        # Combined tech detection
+        combined = f"{tweet_text} {gh_text} {page_text}"
+        novel = _detect_novel_tech(combined)
+        result["novel_tech"] = novel
+        result["category"] = _detect_category(combined)
 
-        # Tech signals from tweet text
-        for n in _detect_novel_tech(tweet_text):
-            if n not in result["novel_tech"]:
-                result["novel_tech"].append(n)
-        if _detect_testnet(tweet_text):
+        if _detect_testnet(combined):
             result["testnet_active"] = True
+
+        if novel:
+            result["research_notes"].append(f"🔬 Tech: {', '.join(novel)}")
 
         db.set_research_cache(project_name, result)
         return result
 
 
-# ── Public interface: research a batch of candidates ──────────────────────
-
 async def research_projects_async(candidates: list[dict]) -> list[dict]:
     """
     Research all candidates concurrently.
-    Attaches project dict to each candidate.
-    Returns only candidates where research succeeded and token is not live.
-
-    Called by pipeline_async.py's research_stage_async().
+    v0.7.2: semaphores created fresh here — never reused across event loops.
     """
     if not AIOHTTP_AVAILABLE:
-        logger.error(
-            "aiohttp not available — cannot run async research. "
-            "Falling back is handled by pipeline_async.py."
-        )
+        logger.error("aiohttp not available — cannot run async research.")
         return []
 
-    # Create semaphores fresh inside this event loop — never reuse across loops
+    # Fresh semaphores for this event loop — key fix for the crash bug
     semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS)
-    coingecko_sem = asyncio.Semaphore(1)  # Serialise CoinGecko — 1 at a time
+    coingecko_sem = asyncio.Semaphore(1)
     timeout = aiohttp.ClientTimeout(total=settings.REQUEST_TIMEOUT)
 
     async with aiohttp.ClientSession(
@@ -435,14 +424,11 @@ async def research_projects_async(candidates: list[dict]) -> list[dict]:
     enriched = []
     for c, res in zip(candidates, results):
         if isinstance(res, Exception):
-            logger.error(
-                "Async research exception for '%s': %s",
-                c["project_name"], res
-            )
+            logger.error("Async research exception for '%s': %s",
+                         c["project_name"], res)
             continue
         if res.get("has_token"):
-            logger.info("Async: '%s' token live — skipping",
-                        c["project_name"])
+            logger.info("Async: '%s' token live — skipping", c["project_name"])
             continue
         c["project"] = res
         c["project"]["mentioned_by"] = c["handle"]

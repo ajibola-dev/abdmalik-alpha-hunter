@@ -341,14 +341,13 @@ def alert_stage(candidates: list[dict], scan_id: str) -> int:
                     scan_id, name, score_result.score
                 )
 
-                # Auto-add grind tasks
-                for task in action_plan["immediate_tasks"][:3]:
-                    db.add_grind_task(
-                        project_id=project_id,
-                        wallet_label="Wallet 1",
-                        wallet_address="",
-                        task=task,
-                    )
+                # Auto-add per-wallet tasks (v0.9)
+                from modules.action_planner import generate_wallet_tasks_for_db
+                wallet_tasks = generate_wallet_tasks_for_db(
+                    project, project_id, action_plan
+                )
+                for wt in wallet_tasks:
+                    db.add_grind_task(**wt)
 
         except Exception as exc:
             logger.error("[%s] alert error for '%s': %s",
@@ -696,4 +695,41 @@ def run_github_scan_cycle():
                 genesis_count += 1
 
     logger.info("[%s] GitHub cycle complete — %d alerts sent",
+                scan_id, genesis_count)
+
+def run_coingecko_scan_cycle():
+    """
+    CoinGecko trending + search scan — v0.8.
+    Catches projects spiking in search before they appear on Twitter.
+    Runs every 6 hours.
+    """
+    from modules.coingecko_scanner import run_coingecko_scan
+
+    scan_id = _make_scan_id()
+    logger.info("=" * 60)
+    logger.info("📈 CoinGecko Scan Cycle Starting [%s]", scan_id)
+    logger.info("=" * 60)
+
+    qualified = run_coingecko_scan(scan_id=scan_id)
+    genesis_count = 0
+
+    for item in qualified:
+        project = item["project"]
+        project_id = item["project_id"]
+        score_result = item["score_result"]
+
+        if (not already_alerted(project_id, "coingecko") and
+                db.alerts_today() < settings.MAX_ALERTS_PER_DAY):
+
+            action_plan = generate_action_plan(project, score_result)
+            message = (
+                "📈 <b>ALPHA HUNTER — TRENDING SIGNAL</b>\n"
+                f"<i>Source: CoinGecko {project.get('source','').replace('coingecko_','').upper()}</i>\n\n"
+            ) + format_action_plan_for_telegram(project, score_result, action_plan)
+
+            if send_message(message):
+                db.log_alert(project_id, "coingecko")
+                genesis_count += 1
+
+    logger.info("[%s] CoinGecko cycle complete — %d alerts sent",
                 scan_id, genesis_count)
