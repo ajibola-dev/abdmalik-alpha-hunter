@@ -195,7 +195,8 @@ def fetch_tweet_from_url(tweet_url: str) -> Optional[dict]:
     v0.7.2: tries multiple endpoint patterns — the /tweet endpoint with pid=
     often returns empty or a different structure. Falls back gracefully.
     """
-    match = re.search(r'/status/(\d+)', tweet_url)
+    # v0.9.1: handle both /username/status/ID and /i/status/ID formats
+    match = re.search(r'/(?:i/)?status/(\d+)', tweet_url)
     if not match:
         logger.warning("fetch_tweet_from_url: no tweet ID found in URL: %s", tweet_url)
         return None

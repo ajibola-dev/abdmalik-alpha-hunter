@@ -352,12 +352,19 @@ def format_action_plan_for_telegram(project: dict, score_result,
     template_used = action_plan.get("tech_template_used", "default")
     wallets = action_plan["wallet_recommendation"]
 
+    # v0.9.1: show X profile link instead of bare @handle
+    # bare @handle in Telegram tries to tag a Telegram user — wrong behaviour
+    if mentioned_by and not mentioned_by.startswith("["):
+        caller_str = f'<a href="https://twitter.com/{mentioned_by}">@{mentioned_by}</a>'
+    else:
+        caller_str = mentioned_by or "autonomous scan"
+
     msg = (
         f"🎯 <b>ALPHA HUNTER — GENESIS CALL</b>\n\n"
         f"<b>Project:</b> {name}\n"
         f"<b>Score:</b> {score_result.score}/10 — {score_result.label}\n"
         f"<b>Category:</b> {category}\n"
-        f"<b>Called by:</b> @{mentioned_by}\n"
+        f"<b>Called by:</b> {caller_str}\n"
         f"<b>Funding:</b> {funding_str}\n"
         f"<b>Investors:</b> {investors[:100] if investors else 'Unknown'}\n"
         f"<b>Tech:</b> {tech_str}\n"

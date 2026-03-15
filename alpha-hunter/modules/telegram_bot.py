@@ -613,8 +613,9 @@ def _cmd_debug(chat_id: str):
 
 def _research_pasted_text(chat_id: str, text: str, pipeline_callback=None):
     """
-    v0.7.2: Research pasted tweet text directly — no URL needed.
-    Called when user pastes tweet text into the chat.
+    v0.9.1: Research pasted tweet text.
+    Quality gate: only returns results for projects scoring >= 3.0.
+    General commentary tweets return a clean "no alpha found" message.
     """
     import threading
     def _run():
@@ -623,20 +624,41 @@ def _research_pasted_text(chat_id: str, text: str, pipeline_callback=None):
             from modules.pipeline import process_tweet
             tweet = research_text_directly(text)
             results = process_tweet(tweet, caller_tier=1)
-            if not results:
-                send_message(
-                    "🔍 No alpha projects detected in that text.\n"
-                    "Make sure it contains project names, funding info, or testnet signals.",
-                    chat_id=chat_id
-                )
+
+            # v0.9.1: filter to meaningful scores only — suppress noise
+            meaningful = [r for r in results if r["score_result"].score >= 3.0]
+
+            if not meaningful:
+                if results:
+                    # Had extractions but all scored too low
+                    names = [r["project"]["name"] for r in results]
+                    send_message(
+                        f"🔍 Extracted {len(results)} candidate(s) but none scored above 3.0.\n"
+                        f"Names found: {', '.join(names[:5])}\n\n"
+                        f"<i>These appear to be general words, not specific projects. "
+                        f"Try pasting a tweet that mentions a specific project name, "
+                        f"funding round, or testnet launch.</i>",
+                        chat_id=chat_id
+                    )
+                else:
+                    send_message(
+                        "🔍 No project names detected in that text.\n"
+                        "<i>Paste a tweet mentioning a specific project, "
+                        "funding round, or testnet.</i>",
+                        chat_id=chat_id
+                    )
                 return
-            for item in results:
+
+            for item in meaningful:
                 project = item["project"]
                 score_result = item["score_result"]
-                from modules.action_planner import generate_action_plan, format_action_plan_for_telegram
+                from modules.action_planner import (
+                    generate_action_plan, format_action_plan_for_telegram
+                )
                 action_plan = generate_action_plan(project, score_result)
                 message = format_action_plan_for_telegram(project, score_result, action_plan)
                 send_message(message, chat_id=chat_id)
+
         except Exception as exc:
             send_message(f"❌ Research error: {exc}", chat_id=chat_id)
     threading.Thread(target=_run, daemon=True).start()
