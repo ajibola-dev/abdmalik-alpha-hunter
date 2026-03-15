@@ -94,6 +94,8 @@ def _cmd_start(chat_id: str):
         "/watchlist — Monitored X accounts\n"
         "/tasks — Your pending grind tasks\n"
         "/done &lt;id&gt; — Mark task complete\n"
+        "/wallets — Wallet summary with progress bars\n"
+        "/addwallet &lt;project&gt; &lt;label&gt; &lt;task&gt; — Add task to specific wallet\n"
         "/status — Agent health\n"
         "/research &lt;tweet_url&gt; — Research a tweet\n"
         "/backfill [N] — Scan last N tweets per account (default 50)\n"
@@ -245,18 +247,137 @@ def _cmd_status(chat_id: str):
     )
 
 
-def _cmd_tasks(chat_id: str):
+def _cmd_tasks(chat_id: str, wallet: str = None):
+    """
+    Show pending grind tasks, grouped by wallet.
+    /tasks          — all wallets
+    /tasks wallet1  — only Wallet 1
+    """
     from modules.database import get_grind_tasks
     tasks = get_grind_tasks()
     pending = [t for t in tasks if t["status"] == "pending"]
+
+    # Filter by wallet label if specified
+    if wallet:
+        pending = [t for t in pending
+                   if wallet.lower() in (t["wallet_label"] or "").lower()]
+
     if not pending:
         send_message("✅ No pending tasks! You're all caught up.",
                      chat_id=chat_id)
         return
-    msg = "📝 <b>Pending Grind Tasks</b>\n\n"
-    for t in pending[:10]:
-        msg += (f"[{t['id']}] <b>{t['project_name']}</b> "
-                f"({t['wallet_label']})\n{t['task']}\n\n")
+
+    # Group by wallet
+    wallets = {}
+    for t in pending:
+        wl = t["wallet_label"] or "Wallet 1"
+        wallets.setdefault(wl, []).append(t)
+
+    msg = f"📝 <b>Grind Tasks</b> — {len(pending)} pending\n"
+    msg += f"<i>Use /done &lt;id&gt; to complete · /tasks wallet2 to filter</i>\n\n"
+
+    for wl, wtasks in wallets.items():
+        msg += f"<b>💼 {wl}</b>\n"
+        for t in wtasks[:5]:
+            status_icon = "🔄" if t["status"] == "pending" else "✅"
+            msg += f"  [{t['id']}] {status_icon} <b>{t['project_name']}</b>\n"
+            msg += f"       {t['task'][:80]}\n"
+        msg += "\n"
+
+    send_message(msg, chat_id=chat_id)
+
+
+def _cmd_addwallet(chat_id: str, args: str):
+    """
+    /addwallet <project> <wallet_label> <task>
+    e.g. /addwallet miden "Wallet 2" "Bridge to testnet and swap"
+    """
+    from modules.database import _conn, add_grind_task
+    import sqlite3, shlex
+    try:
+        parts = shlex.split(args)
+        if len(parts) < 3:
+            raise ValueError
+        project_name = parts[0]
+        wallet_label = parts[1]
+        task = " ".join(parts[2:])
+    except Exception:
+        send_message(
+            "Usage: /addwallet &lt;project&gt; &lt;wallet_label&gt; &lt;task&gt;\n"
+            "Example: /addwallet miden \"Wallet 2\" \"Bridge and swap on testnet\"",
+            chat_id=chat_id
+        )
+        return
+
+    with _conn() as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT id FROM discovered_projects WHERE name LIKE ?",
+            (f"%{project_name}%",)
+        ).fetchone()
+
+    if not row:
+        send_message(
+            f"Project '{project_name}' not found in DB.\n"
+            f"Run /backfill or wait for next scan.",
+            chat_id=chat_id
+        )
+        return
+
+    add_grind_task(
+        project_id=row["id"],
+        wallet_label=wallet_label,
+        wallet_address="",
+        task=task,
+    )
+    send_message(
+        f"✅ Task added to <b>{wallet_label}</b> for <b>{project_name}</b>\n"
+        f"<i>{task}</i>\n\n"
+        f"Use /tasks to see all pending tasks.",
+        chat_id=chat_id
+    )
+
+
+def _cmd_wallets(chat_id: str):
+    """Show wallet summary — tasks per wallet, completion rate."""
+    from modules.database import _conn
+    import sqlite3
+    with _conn() as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT
+                g.wallet_label,
+                COUNT(*) as total,
+                SUM(CASE WHEN g.status='done' THEN 1 ELSE 0 END) as done,
+                GROUP_CONCAT(DISTINCT p.name) as projects
+            FROM grind_tracker g
+            JOIN discovered_projects p ON p.id = g.project_id
+            GROUP BY g.wallet_label
+            ORDER BY g.wallet_label
+        """).fetchall()
+
+    if not rows:
+        send_message(
+            "No wallets tracked yet.\n"
+            "Tasks are auto-added on genesis alerts, or use /addwallet.",
+            chat_id=chat_id
+        )
+        return
+
+    msg = "💼 <b>Wallet Summary</b>\n\n"
+    for r in rows:
+        total = r["total"]
+        done = r["done"] or 0
+        pct = int((done / total) * 100) if total > 0 else 0
+        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+        projects = (r["projects"] or "").split(",")[:4]
+        proj_str = ", ".join(p.strip() for p in projects)
+        msg += (
+            f"<b>{r['wallet_label']}</b>\n"
+            f"  {bar} {pct}% ({done}/{total} tasks done)\n"
+            f"  Projects: {proj_str}\n\n"
+        )
+
     send_message(msg, chat_id=chat_id)
 
 
@@ -509,9 +630,15 @@ def _handle_message(text: str, chat_id: str, pipeline_callback=None):
     elif lower.startswith("/status"):
         _cmd_status(chat_id)
     elif lower.startswith("/tasks"):
-        _cmd_tasks(chat_id)
+        parts = text.split(maxsplit=1)
+        wallet_filter = parts[1] if len(parts) > 1 else None
+        _cmd_tasks(chat_id, wallet=wallet_filter)
     elif lower.startswith("/done "):
         _cmd_done(chat_id, text[6:].strip())
+    elif lower.startswith("/wallets"):
+        _cmd_wallets(chat_id)
+    elif lower.startswith("/addwallet "):
+        _cmd_addwallet(chat_id, text[11:].strip())
     elif lower.startswith("/research ") or "twitter.com/" in lower or "x.com/" in lower:
         urls = re.findall(r'https?://(?:twitter\.com|x\.com)/\S+', text)
         if urls and pipeline_callback:
