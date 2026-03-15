@@ -114,11 +114,15 @@ _NOISE_WORDS = {
     "seize", "control", "chambers", "november", "surviving",
     "faction", "journey", "reuniting", "rebuild", "fate",
     "opensea", "polymarket", "coinbase", "zora", "base",
-    "polygon", "dime", "miled", "privacy", "users",
+    "polygon", "dime", "miled", "milked", "privacy", "users",
     # Generic action/state words
     "migrated", "deployed", "shipped", "released", "updated",
     "announced", "confirmed", "revealed", "reported", "shared",
     "posted", "replied", "retweeted", "liked", "followed",
+    # Structural false positives — "X Mainnet", "X Users", "X Protocol" etc
+    "mainnet", "testnet", "devnet", "users", "network", "protocol",
+    "finance", "capital", "ventures", "labs", "foundation",
+    "rewards", "points", "season", "airdrop", "drop",
 }
 
 
@@ -220,6 +224,23 @@ def extract_project_names(tweet_text: str,
                 if (len(match) >= 5 and match not in _NOISE_WORDS
                         and not match.isdigit()):
                     candidates.append(match)
+
+    # ── Trailing suffix strip ─────────────────────────────────────────────
+    # Removes "Polygon Mainnet" → dropped (mainnet is noise),
+    # "Story Protocol" → kept (protocol stripped but "Story" passes)
+    _SUFFIX_NOISE = {
+        "mainnet", "testnet", "devnet", "network", "protocol",
+        "finance", "capital", "ventures", "labs", "foundation",
+        "users", "rewards", "points", "season", "airdrop",
+    }
+    stripped = []
+    for c in candidates:
+        parts = c.split()
+        # Remove trailing noise word
+        if len(parts) > 1 and parts[-1].lower() in _SUFFIX_NOISE:
+            c = " ".join(parts[:-1])
+        stripped.append(c)
+    candidates = stripped
 
     # ── Deduplicate and clean ─────────────────────────────────────────────
     seen = set()
