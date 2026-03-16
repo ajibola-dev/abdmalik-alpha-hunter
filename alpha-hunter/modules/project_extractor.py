@@ -205,22 +205,39 @@ def extract_project_names(tweet_text: str,
     """
     log_ctx = f"[scan={scan_id} tweet={tweet_id}]" if scan_id else ""
 
-    if not _is_alpha_tweet(tweet_text):
-        return []
-
     candidates = []
     sentences = _split_sentences(tweet_text)
 
     # ── Priority 1: Numbered list items ──────────────────────────────────
-    # Numbered lists are inherently structured alpha — bypass proximity gate
+    # Numbered lists bypass ALL gates — structured alpha regardless of
+    # signal words. '1. arc 2. fhenix 3. zama' always worth extracting.
     list_items = re.findall(
-        r'^\s*\d+[\.\)]\s+([A-Z][A-Za-z0-9][A-Za-z0-9\s]{1,28}?)(?:\s*[\(\n]|$)',
+        r'^\s*\d+[\.\)]\s+([A-Za-z][A-Za-z0-9][A-Za-z0-9\s]{0,28}?)(?:\s*[\(\n,]|$)',
         tweet_text, re.MULTILINE
     )
     for item in list_items:
         item = item.strip()
         if item and item.lower() not in _NOISE_WORDS:
             candidates.append(item)
+
+    # Numbered list found items — return immediately, highest confidence path
+    if candidates:
+        seen = set()
+        cleaned = []
+        for c in candidates:
+            c = ' '.join(c.split())
+            cl = c.lower()
+            if c and len(c) > 1 and cl not in _NOISE_WORDS and cl not in seen:
+                seen.add(cl)
+                cleaned.append(c)
+        if cleaned:
+            logger.debug('Numbered list extraction: %s', cleaned)
+            return cleaned[:settings.MAX_CANDIDATES_PER_TWEET]
+
+    # Non-list tweets require alpha signal
+    if not _is_alpha_tweet(tweet_text):
+        return []
+
 
     # ── Priority 2: Conviction phrases — bypass proximity gate ───────────
     phrase_patterns = [

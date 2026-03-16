@@ -36,11 +36,27 @@ _BASE = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}"
 _last_update_id = 0
 
 
+def _sanitise_html(text: str) -> str:
+    """
+    Fix common HTML issues that cause Telegram 400 errors.
+    - Escapes bare & that aren't part of HTML entities
+    - Leaves valid tags and entities intact
+    """
+    import re
+    # Escape & that aren't already HTML entities
+    text = re.sub(r'&(?!(?:amp|lt|gt|quot|apos);)', '&amp;', text)
+    return text
+
+
 def send_message(text: str, chat_id: str = None,
                  parse_mode: str = "HTML") -> bool:
     if not settings.TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN not set")
         return False
+
+    # Sanitise HTML to prevent 400 errors from malformed content
+    if parse_mode == "HTML":
+        text = _sanitise_html(text)
 
     if len(text) > 4000:
         text = text[:3990] + "\n<i>...truncated</i>"

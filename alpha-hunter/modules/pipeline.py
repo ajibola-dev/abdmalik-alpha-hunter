@@ -149,20 +149,36 @@ _KNOWN_LIVE_TOKENS = {
     "pendle", "ethena", "ondo", "usual", "sky", "maker", "compound",
 }
 
+# Multi-word phrases that are never project names — seen in logs
+_NOISE_PHRASES = {
+    "airdrop era", "bitcoin ethereum", "ripple stellar", "cardano doge",
+    "tron monero", "litecoin neo", "jack devine", "deputy director",
+    "arkin group", "execute solana", "privy privy", "sapiensolana human",
+    "those who", "airdrop era",
+}
+
+# Single words that are clearly not crypto projects
+_HARD_NOISE_WORDS = {
+    "risk", "return", "those", "iran", "strait", "hormuz", "grind",
+    "sennin", "episode", "copytrade", "onboarded", "animoca",
+    "afk", "knx", "markets", "bitcoin", "ethereum", "ripple",
+    "stellar", "cardano", "doge", "tron", "monero", "litecoin", "neo",
+}
+
 
 def fast_filter_stage(candidates: list[dict], scan_id: str) -> list[dict]:
     """
-    Stage 2 — Fast pre-research filter. Drops candidates that are
-    almost certainly noise without making any API calls.
-
-    Filter rules:
-      - Name too short (≤ 2 chars)
-      - Name is all-numeric
-      - Known live token (blocklist — saves CoinGecko calls)
-      - Name already has a confirmed live token in DB research cache
+    Stage 2 — Fast pre-research filter. v0.9.3: expanded noise detection.
+    Drops obvious non-projects without any API calls.
     """
+    import re as _re
+
     logger.info("[%s] ── fast_filter_stage (%d candidates) ──",
                 scan_id, len(candidates))
+
+    # Whitelist — short names that ARE real projects
+    _WHITELIST = {"miden", "zama", "thru", "tempo", "dtel", "kaito",
+                  "blur", "ondo", "knx", "afk"}
 
     passed = []
     for c in candidates:
@@ -179,12 +195,38 @@ def fast_filter_stage(candidates: list[dict], scan_id: str) -> list[dict]:
             logger.debug("[%s] fast_filter: '%s' all-numeric", scan_id, name)
             continue
 
-        # Known live token blocklist — skip CoinGecko entirely
+        # Hard noise words
+        if name_lower in _HARD_NOISE_WORDS:
+            logger.debug("[%s] fast_filter: '%s' hard noise", scan_id, name)
+            continue
+
+        # Noise phrases
+        if name_lower in _NOISE_PHRASES:
+            logger.debug("[%s] fast_filter: '%s' noise phrase", scan_id, name)
+            continue
+
+        # Known live token blocklist
         if name_lower in _KNOWN_LIVE_TOKENS:
             logger.debug("[%s] fast_filter: '%s' known live token", scan_id, name)
             continue
 
-        # DB research cache: if we already know this has a live token, skip
+        # Single CamelCase/Title word that looks like a common English word
+        # e.g. "Risk", "Return", "Grind", "Those", "Onboarded"
+        # Exempted: whitelist and words with numbers/special chars
+        if (name_lower not in _WHITELIST
+                and len(name.split()) == 1
+                and len(name) <= 10
+                and _re.match(r'^[A-Z][a-z]+$', name)):
+            # Heuristic: if it appears in English dictionary patterns, skip
+            # (ends in common suffixes, or is purely generic)
+            common_suffixes = ("ed", "ing", "ion", "tion", "ism", "ist",
+                               "ness", "ment", "ble", "ful", "ous")
+            if any(name_lower.endswith(s) for s in common_suffixes):
+                logger.debug("[%s] fast_filter: '%s' common English word",
+                             scan_id, name)
+                continue
+
+        # DB research cache: already confirmed token-live
         cached = db.get_research_cache(name)
         if cached and cached.get("has_token"):
             logger.info("[%s] fast_filter: '%s' token already live (cache)",
@@ -302,44 +344,19 @@ def score_stage(candidates: list[dict], scan_id: str) -> list[dict]:
             logger.info("[%s] scored '%s': %.1f/10 [%s]",
                         scan_id, name, score_result.score, score_result.label)
 
-            # v0.9.2: check if this project is also watched by probation accounts
-            # If so, record it as a cross-mention signal for auto-promotion
-            try:
-                probation = db.get_probation_accounts()
-                if probation and name:
-                    # Load all accounts including probation to check for matches
-                    all_accounts = _load_watchlist(include_probation=True)
-                    for pacc in all_accounts:
-                        if pacc.get("status") == "probation":
-                            ph = pacc["handle"].lower()
-                            if ph in probation:
-                                db.record_cross_mention(
-                                    handle=ph,
-                                    mentioned_by=c["handle"],
-                                    project_name=name,
-                                )
-            except Exception:
-                pass  # Never let promotion tracking break scoring
+            # Cross-mention tracking placeholder — re-implemented in future version
 
         except Exception as exc:
             logger.error("[%s] score error for '%s': %s", scan_id, name, exc)
 
     logger.info("[%s] score_stage complete — %d scored", scan_id, len(scored))
 
-    # v0.9.2: auto-promote probation accounts that hit the cross-mention threshold
-    try:
-        counts = db.get_probation_cross_mention_counts(days=30)
-        for handle, stats in counts.items():
-            if stats["projects"] >= 2 and stats["callers"] >= 1:
-                if db.promote_probation_account(handle):
-                    logger.info(
-                        "Auto-promoted @%s from probation to tier 2 "
-                        "(cross-mentioned on %d projects by %d callers)",
-                        handle, stats["projects"], stats["callers"]
-                    )
-    except Exception:
-        pass
-
+    # v0.9.4: auto-promotion disabled until cross-mention tracking is
+    # properly scoped to per-project per-account matching.
+    # Manual promotion via /promote_watchlist still works.
+    # TODO: re-enable when record_cross_mention() is properly called
+    # only when a probation account's own tweet mentions a project
+    # that an active account also mentions.
     return scored
 
 
