@@ -1,12 +1,30 @@
 {
-  "_comment": "Alpha Hunter watchlist. tier=1 → highest trust. weight=1.0 is full tier-1 power, 0.85 = strong tier-1 but slightly below Zun level.",
+  "_comment": "Alpha Hunter watchlist \u2014 v0.9.2",
+  "_acceptance_criteria": {
+    "description": "An account qualifies for this watchlist if it satisfies ALL 5 criteria:",
+    "criteria": [
+      "1. Posts about projects with NO live token yet (pre-TGE, pre-mainnet)",
+      "2. Mentions SPECIFIC project names \u2014 not general commentary",
+      "3. References backing signals: VC names, funding rounds, testnet, node/ambassador programs",
+      "4. Posts BEFORE the project trends \u2014 small/mid following preferred (under 50K ideal)",
+      "5. Structured or specific calls \u2014 numbered lists or individual conviction posts"
+    ],
+    "note": "Zun2025 is the benchmark example, not the standard itself. Any account satisfying all 5 qualifies."
+  },
+  "_tier_guide": {
+    "tier_1": "Satisfies all 5 criteria. Deep infrastructure focus. Conviction calls. Full research weight.",
+    "tier_2": "Satisfies 4/5 criteria. Broader scope or larger following. Slightly discounted weight.",
+    "tier_0": "PROBATION \u2014 in reserve. Not fetched in scans. Promoted to tier 2 automatically if cross-mentioned by tier-1/2 accounts within 30 days, or manually via /approve_watchlist.",
+    "weight": "1.0 = full tier power. 0.85 = strong but slightly below top. 0.75 = solid, being evaluated."
+  },
   "accounts": [
     {
       "handle": "Zun2025",
       "name": "Zun",
       "tier": 1,
       "weight": 1.0,
-      "notes": "Top conviction caller. Deep infrastructure focus. Tier-1 full weight.",
+      "status": "active",
+      "notes": "Benchmark account. Structured pre-TGE conviction lists. Deep infra focus.",
       "trusted": true
     },
     {
@@ -14,7 +32,8 @@
       "name": "defi_explora",
       "tier": 1,
       "weight": 0.85,
-      "notes": "Near-Zun level. Strong alpha, slightly broader. Tier-1 at 0.85 weight.",
+      "status": "active",
+      "notes": "Posts funded projects early. Mentions seed rounds and ambassador programs.",
       "trusted": true
     },
     {
@@ -22,8 +41,99 @@
       "name": "MztaCat",
       "tier": 2,
       "weight": 1.0,
-      "notes": "Large following — projects may be saturated by post time. Tier-2.",
+      "status": "active",
+      "notes": "Broader scope. Occasionally mentions specific projects. Large following.",
       "trusted": true
+    },
+    {
+      "handle": "bigray0x",
+      "name": "bigray0x",
+      "tier": 1,
+      "weight": 0.75,
+      "status": "active",
+      "notes": "Numbered testnet lists, infra focus. Posts free testnet opportunities before they trend. Verified by Grok Mar 2026.",
+      "trusted": false
+    },
+    {
+      "handle": "huseyin1tekin",
+      "name": "huseyin1tekin",
+      "tier": 1,
+      "weight": 0.85,
+      "status": "active",
+      "notes": "Zun2025 + defi_explora both follow. Early Alpha List format. Pre-TGE AI infra with VC backing context. Mutual follow = elevated trust.",
+      "trusted": false
+    },
+    {
+      "handle": "MalikRasak1",
+      "name": "MalikRasak1",
+      "tier": 2,
+      "weight": 0.85,
+      "status": "active",
+      "notes": "Individual early calls with VC backing context. No mutual follows but content quality qualifies. Tier 2 weight 0.85.",
+      "trusted": false
+    },
+    {
+      "handle": "AlphaFrog13",
+      "name": "AlphaFrog13",
+      "tier": 0,
+      "weight": 0.75,
+      "status": "probation",
+      "notes": "PROBATION. Structured early lists with testnet/RWA focus. Promotes if cross-mentioned by active accounts.",
+      "trusted": false
+    },
+    {
+      "handle": "CA_Template",
+      "name": "CA_Template",
+      "tier": 0,
+      "weight": 0.75,
+      "status": "probation",
+      "notes": "PROBATION. Broad farming lists. High noise risk. Promotes if cross-mentioned.",
+      "trusted": false
+    },
+    {
+      "handle": "asedd72",
+      "name": "asedd72",
+      "tier": 0,
+      "weight": 0.75,
+      "status": "probation",
+      "notes": "PROBATION. Mega testnet lists. Tokenless project focus. Promotes if cross-mentioned.",
+      "trusted": false
+    },
+    {
+      "handle": "WEB3Seer",
+      "name": "WEB3Seer",
+      "tier": 0,
+      "weight": 0.7,
+      "status": "probation",
+      "notes": "PROBATION. Daily digest style. Testnet claims and TGE signals. Medium similarity.",
+      "trusted": false
+    },
+    {
+      "handle": "defioyins",
+      "name": "defioyins",
+      "tier": 0,
+      "weight": 0.7,
+      "status": "probation",
+      "notes": "PROBATION. Early testnet/ambassador focus. Individual calls, less structured.",
+      "trusted": false
+    },
+    {
+      "handle": "abrahamonchain",
+      "name": "abrahamonchain",
+      "tier": 0,
+      "weight": 0.7,
+      "status": "probation",
+      "notes": "PROBATION. Technical pre-TGE pattern analysis. Research focused.",
+      "trusted": false
+    },
+    {
+      "handle": "CryptoSchool13",
+      "name": "CryptoSchool13",
+      "tier": 0,
+      "weight": 0.65,
+      "status": "probation",
+      "notes": "PROBATION. Pre-TGE campaign/vesting focus. Medium similarity to criteria.",
+      "trusted": false
     }
   ],
   "auto_discover": true
