@@ -100,6 +100,7 @@ def _cmd_start(chat_id: str):
         "/addwallet &lt;project&gt; &lt;label&gt; &lt;task&gt; — Add task to specific wallet\n"
         "/status — Agent health\n"
         "/research &lt;url or text&gt; — Research a tweet URL or paste text\n"
+        "/lookup &lt;project name&gt; — Research any project by name\n"
         "/backfill [N] — Scan last N tweets per account (default 50)\n"
         "/debug — Diagnose pipeline (tweet fetch, quality gate, extraction)\n"
         "/suggestions — Pending account discoveries\n"
@@ -776,6 +777,121 @@ def _research_pasted_text(chat_id: str, text: str, pipeline_callback=None):
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _cmd_lookup(chat_id: str, project_name: str):
+    """
+    /lookup <project name> — research any project on demand.
+    Runs full research pipeline: DeFiLlama + GitHub + CoinGecko + website.
+    Scores it and stores it. Returns genesis call format if passes threshold,
+    or full research report if below threshold.
+    """
+    if not project_name or len(project_name) < 2:
+        send_message(
+            "Usage: /lookup &lt;project name&gt;\n"
+            "Example: /lookup miden\n"
+            "Example: /lookup Fhenix",
+            chat_id=chat_id
+        )
+        return
+
+    send_message(f"🔍 Looking up <b>{project_name}</b>...", chat_id=chat_id)
+
+    import threading
+    def _run():
+        try:
+            from modules.researcher import research_project
+            from modules.scorer import score_project
+            from modules.action_planner import (
+                generate_action_plan, format_action_plan_for_telegram
+            )
+            from modules.database import upsert_project, save_score
+            import json
+
+            # Force fresh research — clear cache for this lookup
+            from modules import database as db
+            # Research with no tweet text (pure autonomous lookup)
+            project = research_project(project_name, tweet_text="")
+            project["mentioned_by"] = "manual_lookup"
+            project["tweet_url"] = ""
+            project["tweet_text"] = ""
+
+            # Score as autonomous (no caller penalty)
+            score_result = score_project(
+                project, caller_tier=0, caller_weight=1.0
+            )
+
+            # Always store regardless of score
+            project_id = upsert_project(
+                name=project_name,
+                mentioned_by="[lookup]",
+                tweet_url="",
+                tweet_text="",
+                category=project.get("category", ""),
+                funding_usd=project.get("funding_usd", 0),
+                investors=project.get("investors", ""),
+                has_token=project.get("has_token", False),
+                testnet_active=project.get("testnet_active", False),
+                website=project.get("website", ""),
+                github=project.get("github", ""),
+                description=project.get("description", ""),
+            )
+            save_score(
+                project_id=project_id,
+                score=score_result.score,
+                breakdown=json.dumps(score_result.breakdown),
+                label=score_result.label,
+            )
+
+            if project.get("has_token"):
+                send_message(
+                    f"❌ <b>{project_name}</b> already has a live token on CoinGecko.\n"
+                    f"Not worth farming — token is already launched.",
+                    chat_id=chat_id
+                )
+                return
+
+            # Build response
+            funding = project.get("funding_usd", 0) or 0
+            investors = project.get("investors", "") or "Not found"
+            novel_tech = project.get("novel_tech", [])
+            notes = project.get("research_notes", [])
+
+            if score_result.score >= 5.0:
+                # Full genesis call format
+                action_plan = generate_action_plan(project, score_result)
+                message = format_action_plan_for_telegram(
+                    project, score_result, action_plan
+                )
+                send_message(message, chat_id=chat_id)
+            else:
+                # Below threshold — show research summary anyway
+                f_str = f"${funding/1e6:.1f}M" if funding >= 1e6 else "Not found"
+                msg = (
+                    f"🔍 <b>{project_name}</b> — Research Summary\n\n"
+                    f"Score: {score_result.score}/10 — {score_result.label}\n"
+                    f"Category: {project.get('category', '?')}\n"
+                    f"Funding: {f_str}\n"
+                    f"Investors: {investors[:100]}\n"
+                    f"Tech: {', '.join(novel_tech) if novel_tech else 'Not detected'}\n"
+                    f"Testnet: {'Active ✅' if project.get('testnet_active') else 'Not detected'}\n"
+                    f"Token live: {'Yes ❌' if project.get('has_token') else 'No ✅'}\n\n"
+                    f"<b>Research notes:</b>\n"
+                )
+                for note in notes[:5]:
+                    msg += f"  {note}\n"
+                msg += (
+                    f"\n<i>Score {score_result.score}/10 — below 5.0 threshold.\n"
+                    f"Stored for tracking. Use /project {project_name} for details.</i>"
+                )
+                send_message(msg, chat_id=chat_id)
+
+        except Exception as exc:
+            send_message(f"❌ Lookup failed: {exc}", chat_id=chat_id)
+            import logging
+            logging.getLogger(__name__).error("Lookup error: %s", exc)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ── Main command router ────────────────────────────────────────────────────
 
 def _handle_message(text: str, chat_id: str, pipeline_callback=None):
@@ -834,6 +950,8 @@ def _handle_message(text: str, chat_id: str, pipeline_callback=None):
         _cmd_reject(chat_id, text[8:].strip())
     elif lower.startswith("/suggestions"):
         _cmd_suggestions(chat_id)
+    elif lower.startswith("/lookup "):
+        _cmd_lookup(chat_id, text[8:].strip())
     elif lower.startswith("/debug"):
         _cmd_debug(chat_id)
     elif lower.startswith("/backfill"):
