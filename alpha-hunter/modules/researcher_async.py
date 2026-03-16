@@ -38,10 +38,6 @@ import threading
 _defillama_thread_lock = threading.Lock()
 
 
-def _get_defillama_lock():
-    """Returns a fresh asyncio.Lock each call — avoids event loop binding."""
-    return asyncio.Lock()
-
 
 async def _async_get(session: "aiohttp.ClientSession",
                      url: str,
@@ -87,29 +83,34 @@ async def _async_get(session: "aiohttp.ClientSession",
 
 
 async def _ensure_defillama_cache(session: "aiohttp.ClientSession"):
-    """Load DeFiLlama cache if stale. Uses fresh asyncio.Lock per call."""
+    """
+    Load DeFiLlama cache if stale.
+    v0.9.3: uses threading.Lock (not asyncio.Lock) to prevent multiple
+    concurrent coroutines from each triggering a fetch simultaneously.
+    Only one fetch happens; others wait and reuse the result.
+    """
     global _defillama_cache, _defillama_cache_time
-    age = time.time() - _defillama_cache_time
-    if _defillama_cache and age < settings.DEFILLAMA_CACHE_TTL:
-        return
 
-    # Use a fresh lock — safe across event loops
-    async with _get_defillama_lock():
+    # Fast path — already cached
+    with _defillama_thread_lock:
         age = time.time() - _defillama_cache_time
         if _defillama_cache and age < settings.DEFILLAMA_CACHE_TTL:
             return
-        logger.info("Fetching DeFiLlama raises (async, one-time)...")
-        data = await _async_get(session, "https://api.llama.fi/raises")
-        if data:
-            import json
-            try:
-                with _defillama_thread_lock:
-                    _defillama_cache = json.loads(data).get("raises", [])
-                    _defillama_cache_time = time.time()
-                logger.info("DeFiLlama async cache: %d records",
-                            len(_defillama_cache))
-            except Exception as exc:
-                logger.error("DeFiLlama parse error: %s", exc)
+        # Mark as fetching with a sentinel so other coroutines skip
+        _defillama_cache_time = time.time()  # prevents re-entry during fetch
+
+    logger.info("Fetching DeFiLlama raises (async, one-time)...")
+    data = await _async_get(session, "https://api.llama.fi/raises")
+    if data:
+        import json
+        try:
+            parsed = json.loads(data).get("raises", [])
+            with _defillama_thread_lock:
+                _defillama_cache = parsed
+                _defillama_cache_time = time.time()
+            logger.info("DeFiLlama async cache: %d records", len(_defillama_cache))
+        except Exception as exc:
+            logger.error("DeFiLlama parse error: %s", exc)
 
 
 def _search_defillama_cache(project_name: str) -> dict:
@@ -259,6 +260,9 @@ _TECH_SIGNAL_MAP = {
     "payments": "payments", "stablecoin": "payments",
     "layer 1": "layer 1", "l1 blockchain": "layer 1",
     "layer 2": "layer 2", "l2": "layer 2",
+    # Synced with researcher.py (were missing from async version)
+    "aa wallet": "account abstraction",
+    "on-chain identity": "identity",
 }
 
 

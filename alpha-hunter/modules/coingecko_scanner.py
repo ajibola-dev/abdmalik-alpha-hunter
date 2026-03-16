@@ -81,20 +81,6 @@ def _is_blocklisted(name: str) -> bool:
     return any(b in name.lower() for b in _LAUNCHED_BLOCKLIST)
 
 
-def _has_live_token(name: str, coin_data: dict) -> bool:
-    """
-    Check if a CoinGecko coin has actual market data (i.e., token is live).
-    Coins with market_cap_rank are typically launched.
-    """
-    rank = coin_data.get("market_cap_rank")
-    if rank and rank < 500:
-        return True
-    # If it has a market cap, it's launched
-    if coin_data.get("market_cap", 0):
-        return True
-    return False
-
-
 def scan_trending() -> list[dict]:
     """
     Fetch CoinGecko trending coins — top 15 by search volume.
@@ -177,9 +163,10 @@ def scan_search_keywords() -> list[dict]:
                     "description": f"Appearing in CoinGecko search for '{keyword}'",
                     "source": "coingecko_search",
                     "has_token": False,
-                    "testnet_active": "testnet" in keyword,
+                    "testnet_active": "testnet" in keyword or "incentivized testnet" in keyword,
                     "novel_tech": [keyword] if keyword in [
-                        "zk rollup", "depin", "restaking", "fhe", "modular blockchain"
+                        "zk rollup", "depin", "restaking", "fhe",
+                        "modular blockchain", "incentivized testnet"
                     ] else [],
                     "search_keywords": [keyword],
                 }

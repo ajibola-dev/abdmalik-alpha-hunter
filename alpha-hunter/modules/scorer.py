@@ -162,7 +162,7 @@ def _caller_quality_raw(caller_tier: int, caller_weight: float = 1.0) -> float:
 
 
 def score_project(project: dict, caller_tier: int = 2,
-                  caller_count: int = 1,
+                  caller_count: int = 1,  # always 1 currently — reserved for multi-caller
                   caller_weight: float = 1.0) -> ScoreResult:
     """Score a project 0-10 using calibrated Zun Method weights."""
     investors  = project.get("investors", "") or ""

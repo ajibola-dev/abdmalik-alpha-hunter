@@ -351,6 +351,7 @@ def get_all_projects():
 
 
 def get_grind_tasks(project_name: str = None):
+    # project_name filter currently unused — reserved for future /tasks <project> command
     with _conn() as con:
         con.row_factory = sqlite3.Row
         if project_name:
