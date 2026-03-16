@@ -284,13 +284,9 @@ def _cmd_watchlist(chat_id: str):
 
 
 def _cmd_watchlist_review(chat_id: str):
-    """
-    v0.9.2: Show probation account status with cross-mention counts.
-    Accounts that hit the threshold are highlighted for promotion.
-    """
+    """Show probation accounts. Manual promotion via /promote_watchlist."""
     import json as _json
     from config.settings import settings
-    from modules.database import get_probation_cross_mention_counts, promote_probation_account
 
     try:
         with open(settings.WATCHLIST_PATH) as f:
@@ -305,60 +301,55 @@ def _cmd_watchlist_review(chat_id: str):
         send_message("No accounts on probation.", chat_id=chat_id)
         return
 
-    counts = get_probation_cross_mention_counts(days=30)
+    msg = f"🔬 <b>Probation Accounts</b> ({len(probation)})\n"
+    msg += "<i>Use /promote_watchlist &lt;handle&gt; to activate an account</i>\n\n"
 
-    msg = f"🔬 <b>Probation Review</b> ({len(probation)} accounts)\n"
-    msg += "<i>Accounts are auto-promoted when cross-mentioned on 2+ projects by active callers</i>\n\n"
-
-    promoted = []
     for a in probation:
         handle = a["handle"]
-        hl = handle.lower()
-        stats = counts.get(hl, {"projects": 0, "callers": 0})
-        projects = stats["projects"]
-        callers = stats["callers"]
         twitter_url = f"https://twitter.com/{handle}"
-
-        if projects >= 2 and callers >= 1:
-            status = "✅ READY TO PROMOTE"
-            promoted.append(handle)
-        elif projects >= 1:
-            status = f"👀 {projects} project(s) seen — watching"
-        else:
-            status = "⏳ No cross-mentions yet"
-
-        msg += (
-            f"<a href='{twitter_url}'>@{handle}</a> — {status}\n"
-            f"  Cross-mentions: {projects} project(s) by {callers} caller(s)\n\n"
-        )
-
-    if promoted:
-        msg += f"\nUse /promote_watchlist {promoted[0]} to promote manually,\n"
-        msg += "or they'll be auto-promoted on the next scan."
+        notes = a.get("notes", "")
+        msg += f"<a href='{twitter_url}'>@{handle}</a>\n"
+        if notes:
+            msg += f"  <i>{notes[:80]}</i>\n"
+        msg += "\n"
 
     send_message(msg, chat_id=chat_id)
 
 
 def _cmd_promote_watchlist(chat_id: str, handle: str):
     """Manually promote a probation account to active tier 2."""
-    from modules.database import promote_probation_account
+    import json as _json
+    from config.settings import settings
     handle = handle.lstrip("@").strip()
     if not handle:
-        send_message("Usage: /promote_watchlist <handle>", chat_id=chat_id)
+        send_message("Usage: /promote_watchlist &lt;handle&gt;", chat_id=chat_id)
         return
-    success = promote_probation_account(handle)
-    if success:
-        send_message(
-            f"✅ <b>@{handle}</b> promoted from probation to Tier 2!\n"
-            f"They'll be monitored from the next scan cycle.",
-            chat_id=chat_id
-        )
-    else:
-        send_message(
-            f"❌ Could not promote @{handle}. "
-            f"Check they're on probation with /watchlist_review.",
-            chat_id=chat_id
-        )
+    try:
+        with open(settings.WATCHLIST_PATH) as f:
+            data = _json.load(f)
+        updated = False
+        for acc in data.get("accounts", []):
+            if acc["handle"].lower() == handle.lower():
+                if acc.get("status") == "probation":
+                    acc["tier"] = 2
+                    acc["status"] = "active"
+                    acc["notes"] = acc.get("notes", "") + " [Manually promoted]"
+                    updated = True
+                    break
+        if updated:
+            with open(settings.WATCHLIST_PATH, "w") as f:
+                _json.dump(data, f, indent=2)
+            send_message(
+                f"✅ <b>@{handle}</b> promoted to Tier 2 — active from next scan.",
+                chat_id=chat_id
+            )
+        else:
+            send_message(
+                f"❌ @{handle} not found in probation. Check /watchlist_review.",
+                chat_id=chat_id
+            )
+    except Exception as exc:
+        send_message(f"❌ Promotion failed: {exc}", chat_id=chat_id)
 
 
 def _cmd_status(chat_id: str):
@@ -822,9 +813,16 @@ def _cmd_lookup(chat_id: str, project_name: str):
             from modules.database import upsert_project, save_score
             import json
 
-            # Force fresh research — clear cache for this lookup
+            # v0.9.6: clear stale cache before lookup
             from modules import database as db
-            # Research with no tweet text (pure autonomous lookup)
+            try:
+                with db._conn() as con:
+                    con.execute(
+                        'DELETE FROM project_research_cache WHERE project_name=?',
+                        (project_name,)
+                    )
+            except Exception:
+                pass
             project = research_project(project_name, tweet_text="")
             project["mentioned_by"] = "manual_lookup"
             project["tweet_url"] = ""
