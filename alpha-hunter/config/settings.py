@@ -23,7 +23,7 @@ class Settings:
 
     # ── API Keys ───────────────────────────────────────────────────────────
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
-    CMC_API_KEY: str = os.getenv("CMC_API_KEY", "")
+    CMC_API_KEY  # optional — used as fallback in funding_scanner verify_no_token(): str = os.getenv("CMC_API_KEY  # optional — used as fallback in funding_scanner verify_no_token()", "")
     X_BEARER_TOKEN: str = os.getenv("X_BEARER_TOKEN", "")
     RAPIDAPI_KEY: str = os.getenv("RAPIDAPI_KEY", "")
 
