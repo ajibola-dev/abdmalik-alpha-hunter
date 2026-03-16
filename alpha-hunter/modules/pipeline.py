@@ -39,14 +39,24 @@ from modules.telegram_bot import send_message
 logger = logging.getLogger(__name__)
 
 
-def _load_watchlist() -> list[dict]:
-    """Load accounts from watchlist.json."""
+def _load_watchlist(include_probation: bool = False) -> list[dict]:
+    """
+    Load accounts from watchlist.json.
+    v0.9.2: tier-0 (probation) accounts are excluded from active scans
+    unless include_probation=True. They remain in DB for cross-mention tracking.
+    """
     import json as _json
     accounts = []
     try:
         with open(settings.WATCHLIST_PATH) as f:
             data = _json.load(f)
-            accounts = data.get("accounts", [])
+            all_accounts = data.get("accounts", [])
+            if include_probation:
+                accounts = all_accounts
+            else:
+                accounts = [a for a in all_accounts
+                            if a.get("tier", 2) > 0
+                            and a.get("status", "active") != "probation"]
     except Exception as exc:
         logger.error("Could not load watchlist: %s", exc)
     return accounts
@@ -292,10 +302,44 @@ def score_stage(candidates: list[dict], scan_id: str) -> list[dict]:
             logger.info("[%s] scored '%s': %.1f/10 [%s]",
                         scan_id, name, score_result.score, score_result.label)
 
+            # v0.9.2: check if this project is also watched by probation accounts
+            # If so, record it as a cross-mention signal for auto-promotion
+            try:
+                probation = db.get_probation_accounts()
+                if probation and name:
+                    # Load all accounts including probation to check for matches
+                    all_accounts = _load_watchlist(include_probation=True)
+                    for pacc in all_accounts:
+                        if pacc.get("status") == "probation":
+                            ph = pacc["handle"].lower()
+                            if ph in probation:
+                                db.record_cross_mention(
+                                    handle=ph,
+                                    mentioned_by=c["handle"],
+                                    project_name=name,
+                                )
+            except Exception:
+                pass  # Never let promotion tracking break scoring
+
         except Exception as exc:
             logger.error("[%s] score error for '%s': %s", scan_id, name, exc)
 
     logger.info("[%s] score_stage complete — %d scored", scan_id, len(scored))
+
+    # v0.9.2: auto-promote probation accounts that hit the cross-mention threshold
+    try:
+        counts = db.get_probation_cross_mention_counts(days=30)
+        for handle, stats in counts.items():
+            if stats["projects"] >= 2 and stats["callers"] >= 1:
+                if db.promote_probation_account(handle):
+                    logger.info(
+                        "Auto-promoted @%s from probation to tier 2 "
+                        "(cross-mentioned on %d projects by %d callers)",
+                        handle, stats["projects"], stats["callers"]
+                    )
+    except Exception:
+        pass
+
     return scored
 
 

@@ -92,6 +92,8 @@ def _cmd_start(chat_id: str):
         "/newprojects — Discovered last 48h\n"
         "/project &lt;name&gt; — Project details\n"
         "/watchlist — Monitored X accounts\n"
+        "/watchlist_review — Probation accounts + cross-mention counts\n"
+        "/promote_watchlist &lt;handle&gt; — Manually promote a probation account\n"
         "/tasks — Your pending grind tasks\n"
         "/done &lt;id&gt; — Mark task complete\n"
         "/wallets — Wallet summary with progress bars\n"
@@ -109,22 +111,44 @@ def _cmd_start(chat_id: str):
 
 
 def _cmd_topalpha(chat_id: str):
+    """
+    v0.9.3: Shows top projects from ALL sources — Twitter callers,
+    DeFiLlama, GitHub, CoinGecko. Source clearly labelled per project.
+    """
     from modules.database import get_all_projects
     projects = get_all_projects()
     scored = [p for p in projects if p["score"] and p["score"] >= 5]
-    scored = sorted(scored, key=lambda x: x["score"] or 0, reverse=True)[:5]
+    scored = sorted(scored, key=lambda x: x["score"] or 0, reverse=True)[:10]
 
     if not scored:
-        send_message("No high-scoring projects yet. Run a scan first.",
-                     chat_id=chat_id)
+        send_message(
+            "No high-scoring projects yet.\n"
+            "The system scans autonomously every 4-12h — check back soon.",
+            chat_id=chat_id
+        )
         return
 
-    msg = "🏆 <b>Top Alpha Picks</b>\n\n"
+    msg = "🏆 <b>Top Alpha Picks</b> (all sources)\n\n"
     for p in scored:
         funding = p["funding_usd"] or 0
-        f_str = f"${funding/1e6:.0f}M" if funding >= 1e6 else "Unknown funding"
-        msg += (f"<b>{p['name']}</b> — {p['score']}/10 {p['label']}\n"
-                f"  {f_str} | @{p['mentioned_by'] or '?'}\n\n")
+        f_str = f"${funding/1e6:.1f}M" if funding >= 1e6 else "?"
+
+        # Source label
+        mb = p["mentioned_by"] or ""
+        if mb.startswith("[") and mb.endswith("]"):
+            source = mb          # [defillama], [github], [coingecko_trending]
+        elif mb == "manual_paste":
+            source = "manual paste"
+        elif mb:
+            source = f'<a href="https://twitter.com/{mb}">@{mb}</a>'
+        else:
+            source = "autonomous"
+
+        testnet = "🧪" if p["testnet_active"] else ""
+        msg += (
+            f"{testnet}<b>{p['name']}</b> — {p['score']}/10 {p['label']}\n"
+            f"  {f_str} | {source}\n\n"
+        )
     send_message(msg, chat_id=chat_id)
 
 
@@ -205,31 +229,119 @@ def _cmd_project(chat_id: str, name: str):
 
 
 def _cmd_watchlist(chat_id: str):
-    from modules.database import _conn
-    with _conn() as con:
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT * FROM watched_accounts ORDER BY tier, handle"
-        ).fetchall()
-
-    if not rows:
-        send_message("No accounts in watchlist yet.", chat_id=chat_id)
+    """Show active watchlist accounts with X profile links."""
+    import json as _json
+    from config.settings import settings
+    try:
+        with open(settings.WATCHLIST_PATH) as f:
+            data = _json.load(f)
+        accounts = data.get("accounts", [])
+    except Exception as exc:
+        send_message(f"❌ Could not load watchlist: {exc}", chat_id=chat_id)
         return
 
-    msg = "👀 <b>Monitored Accounts</b>\n\n"
-    for r in rows:
-        if r["tier"] == 1:
-            tier_str = "⭐ Tier 1"
+    active = [a for a in accounts if a.get("status", "active") == "active"]
+    probation = [a for a in accounts if a.get("status") == "probation"]
+
+    msg = f"👀 <b>Monitored Accounts</b> ({len(active)} active)\n\n"
+    for a in active:
+        handle = a["handle"]
+        tier = a.get("tier", 2)
+        weight = a.get("weight", 1.0)
+        if tier == 1:
+            tier_str = f"⭐ Tier 1 (w={weight})"
         else:
-            tier_str = "Tier 2"
-        handle = r["handle"]
+            tier_str = f"Tier 2 (w={weight})"
         twitter_url = f"https://twitter.com/{handle}"
         msg += (
-            f"<b>{r['name'] or handle}</b> — {tier_str}\n"
-            f"<a href='{twitter_url}'>@{handle} on X/Twitter</a>\n"
-            f"<i>{r['notes'] or ''}</i>\n\n"
+            f"<b>{a.get('name', handle)}</b> — {tier_str}\n"
+            f"<a href='{twitter_url}'>@{handle} on X/Twitter</a>\n\n"
         )
+
+    if probation:
+        msg += f"\n🔬 <b>On Probation</b> ({len(probation)}) — use /watchlist_review\n"
+        for a in probation:
+            msg += f"  @{a['handle']}\n"
+
     send_message(msg, chat_id=chat_id)
+
+
+def _cmd_watchlist_review(chat_id: str):
+    """
+    v0.9.2: Show probation account status with cross-mention counts.
+    Accounts that hit the threshold are highlighted for promotion.
+    """
+    import json as _json
+    from config.settings import settings
+    from modules.database import get_probation_cross_mention_counts, promote_probation_account
+
+    try:
+        with open(settings.WATCHLIST_PATH) as f:
+            data = _json.load(f)
+        probation = [a for a in data.get("accounts", [])
+                     if a.get("status") == "probation"]
+    except Exception as exc:
+        send_message(f"❌ Could not load watchlist: {exc}", chat_id=chat_id)
+        return
+
+    if not probation:
+        send_message("No accounts on probation.", chat_id=chat_id)
+        return
+
+    counts = get_probation_cross_mention_counts(days=30)
+
+    msg = f"🔬 <b>Probation Review</b> ({len(probation)} accounts)\n"
+    msg += "<i>Accounts are auto-promoted when cross-mentioned on 2+ projects by active callers</i>\n\n"
+
+    promoted = []
+    for a in probation:
+        handle = a["handle"]
+        hl = handle.lower()
+        stats = counts.get(hl, {"projects": 0, "callers": 0})
+        projects = stats["projects"]
+        callers = stats["callers"]
+        twitter_url = f"https://twitter.com/{handle}"
+
+        if projects >= 2 and callers >= 1:
+            status = "✅ READY TO PROMOTE"
+            promoted.append(handle)
+        elif projects >= 1:
+            status = f"👀 {projects} project(s) seen — watching"
+        else:
+            status = "⏳ No cross-mentions yet"
+
+        msg += (
+            f"<a href='{twitter_url}'>@{handle}</a> — {status}\n"
+            f"  Cross-mentions: {projects} project(s) by {callers} caller(s)\n\n"
+        )
+
+    if promoted:
+        msg += f"\nUse /promote_watchlist {promoted[0]} to promote manually,\n"
+        msg += "or they'll be auto-promoted on the next scan."
+
+    send_message(msg, chat_id=chat_id)
+
+
+def _cmd_promote_watchlist(chat_id: str, handle: str):
+    """Manually promote a probation account to active tier 2."""
+    from modules.database import promote_probation_account
+    handle = handle.lstrip("@").strip()
+    if not handle:
+        send_message("Usage: /promote_watchlist <handle>", chat_id=chat_id)
+        return
+    success = promote_probation_account(handle)
+    if success:
+        send_message(
+            f"✅ <b>@{handle}</b> promoted from probation to Tier 2!\n"
+            f"They'll be monitored from the next scan cycle.",
+            chat_id=chat_id
+        )
+    else:
+        send_message(
+            f"❌ Could not promote @{handle}. "
+            f"Check they're on probation with /watchlist_review.",
+            chat_id=chat_id
+        )
 
 
 def _cmd_status(chat_id: str):
@@ -678,6 +790,10 @@ def _handle_message(text: str, chat_id: str, pipeline_callback=None):
         _cmd_newprojects(chat_id)
     elif lower.startswith("/project "):
         _cmd_project(chat_id, text[9:].strip())
+    elif lower.startswith("/watchlist_review"):
+        _cmd_watchlist_review(chat_id)
+    elif lower.startswith("/promote_watchlist "):
+        _cmd_promote_watchlist(chat_id, text[19:].strip())
     elif lower.startswith("/watchlist"):
         _cmd_watchlist(chat_id)
     elif lower.startswith("/status"):

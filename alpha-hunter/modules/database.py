@@ -386,3 +386,88 @@ def complete_task(task_id: int):
             SET status='done', completed_at=datetime('now')
             WHERE id=?
         """, (task_id,))
+
+# ── Probation account management (v0.9.2) ─────────────────────────────────
+
+def get_probation_accounts() -> list[str]:
+    """Return handles of all probation accounts."""
+    import json as _json
+    try:
+        with open(settings.WATCHLIST_PATH) as f:
+            data = _json.load(f)
+        return [a["handle"].lower() for a in data.get("accounts", [])
+                if a.get("status") == "probation"]
+    except Exception:
+        return []
+
+
+def record_cross_mention(handle: str, mentioned_by: str, project_name: str):
+    """
+    Record when a probation account's project is also mentioned
+    by an active account. Used for auto-promotion scoring.
+    """
+    with _conn() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS probation_mentions (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                handle       TEXT,
+                mentioned_by TEXT,
+                project_name TEXT,
+                seen_at      TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        con.execute("""
+            INSERT INTO probation_mentions (handle, mentioned_by, project_name)
+            VALUES (?,?,?)
+        """, (handle.lower(), mentioned_by.lower(), project_name))
+
+
+def get_probation_cross_mention_counts(days: int = 30) -> dict:
+    """
+    Return cross-mention counts per probation account within last N days.
+    Accounts with count >= 2 are candidates for auto-promotion.
+    """
+    with _conn() as con:
+        try:
+            rows = con.execute("""
+                SELECT handle, COUNT(DISTINCT project_name) as project_count,
+                       COUNT(DISTINCT mentioned_by) as caller_count
+                FROM probation_mentions
+                WHERE seen_at >= datetime('now', ?)
+                GROUP BY handle
+                ORDER BY project_count DESC
+            """, (f"-{days} days",)).fetchall()
+            return {r[0]: {"projects": r[1], "callers": r[2]} for r in rows}
+        except Exception:
+            return {}
+
+
+def promote_probation_account(handle: str) -> bool:
+    """
+    Promote a probation account to tier 2 in watchlist.json.
+    Returns True if successful.
+    """
+    import json as _json
+    handle_lower = handle.lower().lstrip("@")
+    try:
+        with open(settings.WATCHLIST_PATH) as f:
+            data = _json.load(f)
+        updated = False
+        for acc in data.get("accounts", []):
+            if acc["handle"].lower() == handle_lower:
+                if acc.get("status") == "probation":
+                    acc["tier"] = 2
+                    acc["status"] = "active"
+                    acc["notes"] = acc.get("notes", "") + " [Auto-promoted: cross-mention threshold met]"
+                    updated = True
+                    break
+        if updated:
+            with open(settings.WATCHLIST_PATH, "w") as f:
+                _json.dump(data, f, indent=2)
+        return updated
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error(
+            "Failed to promote @%s: %s", handle, exc
+        )
+        return False
