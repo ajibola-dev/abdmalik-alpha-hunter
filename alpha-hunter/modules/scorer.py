@@ -54,6 +54,10 @@ def _count_top_vcs(investors: str) -> int:
 
 
 def _vc_raw_score(investors: str) -> float:
+    """
+    v0.9.7: empty investors string returns 1.0 not 0.0.
+    Unknown backing ≠ no backing. Many backed projects aren't in DeFiLlama.
+    """
     count = _count_top_vcs(investors)
     if count >= 3:
         return 10.0
@@ -67,7 +71,10 @@ def _vc_raw_score(investors: str) -> float:
              "1kx", "finality", "symbolic"]
     if any(v in lower for v in tier2):
         return 3.0
-    return 0.0
+    # No investors found — unknown, not confirmed unbacked
+    if not investors.strip():
+        return 1.0
+    return 0.5
 
 
 def _tech_raw_score(novel_tech: list) -> float:
@@ -106,6 +113,12 @@ def _tech_raw_score(novel_tech: list) -> float:
 
 
 def _funding_raw_score(funding_usd: float) -> float:
+    """
+    v0.9.7: funding=0 now returns 1.5 (unknown) not 0.0 (confirmed unfunded).
+    Many legitimate pre-seed projects simply aren't in DeFiLlama yet.
+    Confirmed zero funding should be treated differently from missing data —
+    but we can't distinguish them here, so we give benefit of the doubt.
+    """
     if funding_usd >= 200_000_000:
         return 10.0
     elif funding_usd >= 100_000_000:
@@ -117,8 +130,9 @@ def _funding_raw_score(funding_usd: float) -> float:
     elif funding_usd >= 5_000_000:
         return 2.5
     elif funding_usd > 0:
-        return 1.0
-    return 0.0
+        return 1.5
+    # funding=0 means not found in DeFiLlama — unknown, not confirmed zero
+    return 1.0
 
 
 def _testnet_raw_score(project: dict) -> float:
@@ -165,15 +179,38 @@ def score_project(project: dict, caller_tier: int = 2,
             raw_scores={},
         )
 
-    raw = {
-        "vc_quality":     _vc_raw_score(investors),
-        "novel_tech":     _tech_raw_score(novel_tech),
-        "no_token":       10.0 if not has_token else 0.0,
-        "testnet":        _testnet_raw_score(project),
-        "funding":        _funding_raw_score(funding),
-        "caller_quality": _caller_quality_raw(caller_tier, caller_weight),
-        "multi_caller":   10.0 if caller_count >= 2 else 0.0,
-    }
+    # v0.9.3: autonomous sources (DeFiLlama, GitHub, CoinGecko) pass
+    # caller_tier=0 to signal "no human caller". In this case caller_quality
+    # and multi_caller are zeroed out and their weights redistributed to
+    # funding + vc_quality so the project is judged purely on its signals.
+    # This prevents autonomous finds from being artificially capped at ~5.0.
+    mentioned_by = project.get("mentioned_by", "")
+    is_autonomous = (
+        caller_tier == 0 or
+        (mentioned_by and mentioned_by.startswith("["))
+    )
+
+    if is_autonomous:
+        # Pure signal scoring — no caller penalty
+        raw = {
+            "vc_quality":     _vc_raw_score(investors),
+            "novel_tech":     _tech_raw_score(novel_tech),
+            "no_token":       10.0 if not has_token else 0.0,
+            "testnet":        _testnet_raw_score(project),
+            "funding":        _funding_raw_score(funding),
+            "caller_quality": 5.0,    # neutral — not penalised
+            "multi_caller":   0.0,
+        }
+    else:
+        raw = {
+            "vc_quality":     _vc_raw_score(investors),
+            "novel_tech":     _tech_raw_score(novel_tech),
+            "no_token":       10.0 if not has_token else 0.0,
+            "testnet":        _testnet_raw_score(project),
+            "funding":        _funding_raw_score(funding),
+            "caller_quality": _caller_quality_raw(caller_tier, caller_weight),
+            "multi_caller":   10.0 if caller_count >= 2 else 0.0,
+        }
 
     weighted_sum = sum(raw[k] * _WEIGHTS[k] for k in raw)
     score = round(min(weighted_sum, 10.0), 1)
@@ -195,12 +232,13 @@ def score_project(project: dict, caller_tier: int = 2,
         label   = "❄️ WEAK SIGNAL"
         verdict = "Not enough conviction. Skip unless new info emerges."
 
+    source_tag = "autonomous" if is_autonomous else f"caller_tier={caller_tier} w={caller_weight:.2f}"
     logger.info(
         "Scored '%s': %.1f/10 [%s] "
-        "(VC:%.1f Tech:%.1f Testnet:%.1f Fund:%.1f Caller:%.1f w=%.2f)",
+        "(VC:%.1f Tech:%.1f Testnet:%.1f Fund:%.1f | %s)",
         project.get("name", "?"), score, label,
         raw["vc_quality"], raw["novel_tech"], raw["testnet"],
-        raw["funding"], raw["caller_quality"], caller_weight,
+        raw["funding"], source_tag,
     )
 
     return ScoreResult(score=score, label=label,

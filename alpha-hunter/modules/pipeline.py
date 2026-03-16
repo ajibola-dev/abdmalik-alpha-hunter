@@ -159,10 +159,25 @@ _NOISE_PHRASES = {
 
 # Single words that are clearly not crypto projects
 _HARD_NOISE_WORDS = {
-    "risk", "return", "those", "iran", "strait", "hormuz", "grind",
-    "sennin", "episode", "copytrade", "onboarded", "animoca",
-    "afk", "knx", "markets", "bitcoin", "ethereum", "ripple",
-    "stellar", "cardano", "doge", "tron", "monero", "litecoin", "neo",
+    # Off-topic proper nouns seen in logs
+    "risk", "return", "those", "iran", "strait", "hormuz",
+    "sennin", "episode", "copytrade", "onboarded",
+    # VC/investor names — not projects
+    "animoca", "pantera", "framework", "multicoin", "paradigm",
+    "sequoia", "andreessen", "binance", "coinbase", "kraken",
+    # Generic crypto words extracted as names
+    "farm", "farming", "round", "backed", "beta", "made", "genesis",
+    "grind", "alpha", "signal", "early", "stage", "launch",
+    "airdrop", "points", "rewards", "season", "quest",
+    # Common English words that slip through
+    "good", "great", "still", "just", "only", "real", "true",
+    "high", "low", "new", "old", "big", "small", "fast", "slow",
+    # Names/handles extracted as projects
+    "frogy", "horlaj", "zun", "cat", "malik",
+    # Chain names already live
+    "bitcoin", "ethereum", "ripple", "stellar", "cardano",
+    "doge", "tron", "monero", "litecoin", "neo",
+    "afk", "knx", "markets", "hype", "lit",
 }
 
 
@@ -258,7 +273,16 @@ def research_stage(candidates: list[dict], scan_id: str) -> list[dict]:
         try:
             logger.info("[%s] researching '%s' (via @%s)",
                         scan_id, name, c["handle"])
-            project = research_project(name, tweet_text=tweet_text)
+            # v0.9.6: if tweet is a numbered list with multiple projects,
+            # research each project in isolation to prevent tech contamination.
+            # Detect: tweet has 3+ numbered items AND name appears as a list item
+            import re as _re
+            list_items = _re.findall(
+                r'^\s*\d+[\.\)]\s+(\S+)', tweet_text, _re.MULTILINE
+            )
+            is_list_tweet = len(list_items) >= 3
+            research_text = "" if is_list_tweet else tweet_text
+            project = research_project(name, tweet_text=research_text)
             project["mentioned_by"] = c["handle"]
             project["tweet_url"] = c["tweet"].get("url", "")
             project["tweet_text"] = tweet_text[:500]
