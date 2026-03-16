@@ -110,11 +110,60 @@ _CATEGORY_MAP = {
 }
 
 _BLOCKLIST = {
+    # Base chains / L1s / L2s
     "bitcoin", "ethereum", "solana", "bnb", "polygon", "avalanche",
     "cardano", "polkadot", "cosmos", "tron", "litecoin", "dogecoin",
-    "shiba", "pepe", "floki", "uniswap", "aave", "compound",
+    "arbitrum", "optimism", "base", "zksync", "starknet", "mantle",
+    "scroll", "linea", "blast", "manta", "mode", "taiko",
+    # Meme / low-signal tokens
+    "shiba", "pepe", "floki", "bonk", "wif", "dogwifhat",
+    # Launched DeFi protocols
+    "uniswap", "aave", "compound", "curve", "convex", "balancer",
+    "maker", "spark", "morpho", "pendle", "ethena", "ethena labs",
+    "lido", "rocket pool", "frax", "sky",
+    # Launched infrastructure / known projects
+    "eigenlayer", "symbiotic", "karak",
+    "story", "story protocol",
+    "walrus", "walrus foundation",
+    "redotpay", "coinflow",
+    "daylight", "daylight energy",
+    "meanw hile", "meanwhile",
     "mantra", "mocaverse", "moca", "monad",
+    "hyperliquid", "jupiter", "drift", "jito", "marinade",
+    "wormhole", "layerzero", "axelar", "celer",
+    "chainlink", "pyth", "api3",
+    "the graph", "filecoin", "arweave",
+    "astar", "moonbeam", "acala",
+    "injective", "sei", "aptos", "sui", "movement",
+    "berachain", "fuel", "eclipse",
+    "blur", "opensea", "looks rare",
+    "dydx", "gmx", "gains", "kwenta",
 }
+
+# Blockchain relevance signals — project description must contain at least one
+# A project with none of these is likely not a blockchain-native farming opportunity
+_BLOCKCHAIN_SIGNALS = {
+    "blockchain", "protocol", "chain", "layer", "rollup",
+    "defi", "dapp", "smart contract", "on-chain", "onchain",
+    "testnet", "mainnet", "devnet", "node", "validator",
+    "token", "crypto", "web3", "wallet", "zk", "fhe",
+    "depin", "restaking", "modular", "l1", "l2",
+    "nft", "dao", "governance", "staking", "airdrop",
+}
+
+
+def _is_blockchain_relevant(project: dict) -> bool:
+    """
+    Returns True if the project appears to be blockchain-native.
+    Filters out funded companies that are adjacent to crypto but
+    not actual blockchain projects (insurance companies, ETFs, etc.)
+    """
+    text = " ".join([
+        project.get("description", ""),
+        project.get("category", ""),
+        project.get("name", ""),
+    ]).lower()
+    return any(signal in text for signal in _BLOCKCHAIN_SIGNALS)
 
 _MIN_FUNDING = {
     "Layer 1": 20_000_000, "Layer 2": 15_000_000,
@@ -254,29 +303,125 @@ def scan_cryptorank(scan_id: str = "") -> list[dict]:
 
 # ── Token verification ─────────────────────────────────────────────────────
 
-def verify_no_token(project_name: str, scan_id: str = "") -> bool:
-    """Returns True if NO live token found."""
+def _check_coingecko(project_name: str, proj_lower: str,
+                     proj_first_word: str, scan_id: str) -> bool | None:
+    """
+    Check CoinGecko. Returns:
+      False = token confirmed live (skip project)
+      True  = no token found (safe)
+      None  = API unavailable (try fallback)
+    """
     resp = _http_get(
         "https://api.coingecko.com/api/v3/search",
         params={"query": project_name},
         scan_id=scan_id,
     )
     if resp is None:
-        return True
+        logger.warning("[%s] CoinGecko unavailable for '%s' — trying fallback",
+                       scan_id, project_name)
+        return None  # signal fallback needed
     try:
         coins = resp.json().get("coins", [])
-        for coin in coins[:3]:
-            coin_name = coin.get("name", "").lower()
-            proj_lower = project_name.lower()
-            if proj_lower == coin_name or proj_lower in coin_name.split():
-                logger.debug(
-                    "[%s] project='%s' token live on CoinGecko — skipping",
-                    scan_id, project_name
-                )
+        for coin in coins[:5]:
+            coin_name = coin.get("name", "").lower().strip()
+            coin_symbol = coin.get("symbol", "").lower()
+            rank = coin.get("market_cap_rank")
+            if rank and rank < 2000:
+                if (proj_lower in coin_name or coin_name in proj_lower or
+                        proj_first_word == coin_name.split()[0] or
+                        proj_lower == coin_symbol):
+                    logger.info("[%s] '%s' matched ranked CoinGecko coin '%s' (rank %d)",
+                                scan_id, project_name, coin.get("name"), rank)
+                    return False
+            if proj_lower == coin_name or proj_lower in coin_name or coin_name in proj_lower:
+                logger.info("[%s] '%s' matched CoinGecko coin '%s'",
+                            scan_id, project_name, coin.get("name"))
                 return False
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("[%s] CoinGecko parse error: %s", scan_id, exc)
+        return None
     return True
+
+
+def _check_coinmarketcap(project_name: str, proj_lower: str,
+                          proj_first_word: str, scan_id: str) -> bool | None:
+    """
+    CoinMarketCap fallback — no API key needed for basic search.
+    Returns False (token live), True (no token), or None (unavailable).
+    """
+    resp = _http_get(
+        "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/search/quick",
+        params={"keyword": project_name, "limit": "5"},
+        scan_id=scan_id,
+    )
+    if resp is None:
+        logger.warning("[%s] CoinMarketCap also unavailable for '%s' — skipping safely",
+                       scan_id, project_name)
+        return None
+    try:
+        data = resp.json()
+        coins = data.get("data", {}).get("cryptoCurrencyList", [])
+        for coin in coins:
+            coin_name = coin.get("name", "").lower().strip()
+            coin_symbol = coin.get("symbol", "").lower()
+            rank = coin.get("cmcRank", 9999)
+            if rank < 2000:
+                if (proj_lower in coin_name or coin_name in proj_lower or
+                        proj_first_word == coin_name.split()[0] or
+                        proj_lower == coin_symbol):
+                    logger.info("[%s] '%s' matched ranked CMC coin '%s' (rank %d)",
+                                scan_id, project_name, coin.get("name"), rank)
+                    return False
+            if proj_lower == coin_name or proj_lower in coin_name or coin_name in proj_lower:
+                logger.info("[%s] '%s' matched CMC coin '%s'",
+                            scan_id, project_name, coin.get("name"))
+                return False
+    except Exception as exc:
+        logger.debug("[%s] CMC parse error: %s", scan_id, exc)
+        return None
+    return True
+
+
+def verify_no_token(project_name: str, scan_id: str = "") -> bool:
+    """
+    Returns True if NO live token found — safe to alert.
+
+    Check order:
+      1. Internal blocklist (instant, no API)
+      2. CoinGecko (primary)
+      3. CoinMarketCap (fallback if CoinGecko unavailable)
+      4. If both unavailable — skip safely (return False)
+
+    Never alerts when uncertain.
+    """
+    name_lower = project_name.lower().strip()
+
+    # 1. Blocklist — no API call needed
+    if _is_blocklisted(name_lower):
+        logger.info("[%s] '%s' in blocklist — skipping", scan_id, project_name)
+        return False
+
+    proj_first_word = name_lower.split()[0] if name_lower.split() else name_lower
+
+    # 2. CoinGecko — primary check
+    cg_result = _check_coingecko(project_name, name_lower, proj_first_word, scan_id)
+    if cg_result is False:
+        return False   # token confirmed live
+    if cg_result is True:
+        return True    # confirmed no token
+
+    # 3. CoinMarketCap — fallback when CoinGecko unavailable
+    time.sleep(1)
+    cmc_result = _check_coinmarketcap(project_name, name_lower, proj_first_word, scan_id)
+    if cmc_result is False:
+        return False   # token confirmed live
+    if cmc_result is True:
+        return True    # confirmed no token
+
+    # 4. Both unavailable — skip safely
+    logger.warning("[%s] Both CoinGecko and CMC unavailable for '%s' — skipping",
+                   scan_id, project_name)
+    return False
 
 
 # ── Main funding scan pipeline ────────────────────────────────────────────
@@ -321,6 +466,15 @@ def run_funding_scan(scan_id: str = "") -> list[dict]:
     for project in unique:
         name = project["name"]
         try:
+            # Blockchain relevance check — skip non-blockchain companies
+            if not _is_blockchain_relevant(project):
+                logger.debug(
+                    "[%s] '%s' not blockchain relevant — skipping",
+                    scan_id, name
+                )
+                skipped_pre += 1
+                continue
+
             # Quick pre-score with no API calls
             desc = project.get("description", "")
             project["novel_tech"] = _detect_novel_tech(desc)
