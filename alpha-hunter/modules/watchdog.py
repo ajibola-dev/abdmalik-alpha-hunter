@@ -96,7 +96,10 @@ def _check_scan_heartbeat() -> bool:
     Returns False if no scan has completed within 2× the scan interval.
     Catches silent failures — stuck loops, frozen threads.
     """
-    max_silence = settings.SCAN_INTERVAL_HOURS * 3600 * 2
+    # v1.0: raised from 2x to 3x SCAN_INTERVAL_HOURS.
+    # Funding scanner can take 6h+ due to CoinGecko rate limiting.
+    # With 4h scan interval, 2x = 8h was too short. 3x = 12h is safe.
+    max_silence = settings.SCAN_INTERVAL_HOURS * 3600 * 3
     with _heartbeat_lock:
         age = time.time() - _last_heartbeat
     if age > max_silence:

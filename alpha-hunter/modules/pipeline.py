@@ -148,7 +148,8 @@ _NOISE_PHRASES = {
     "airdrop era", "bitcoin ethereum", "ripple stellar", "cardano doge",
     "tron monero", "litecoin neo", "jack devine", "deputy director",
     "arkin group", "execute solana", "privy privy", "sapiensolana human",
-    "those who", "airdrop era",
+    "abacus global", "performing beyond", "most optimistic",
+    "abacus global management", "those who",
 }
 
 # Single words that are clearly not crypto projects
@@ -166,6 +167,9 @@ _HARD_NOISE_WORDS = {
     # Common English words that slip through
     "good", "great", "still", "just", "only", "real", "true",
     "high", "low", "new", "old", "big", "small", "fast", "slow",
+    # Financial/macro words that appear in off-topic tweets
+    "management", "expectations", "autonomous", "quietly",
+    "technotainment", "performing", "optimistic", "abacus",
     # Names/handles extracted as projects
     "frogy", "horlaj", "zun", "cat", "malik",
     # Chain names already live

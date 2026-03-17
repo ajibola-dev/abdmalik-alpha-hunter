@@ -165,14 +165,17 @@ def _is_blockchain_relevant(project: dict) -> bool:
     ]).lower()
     return any(signal in text for signal in _BLOCKCHAIN_SIGNALS)
 
+# v1.0: minimum funding raised — $5M threshold was passing too many
+# small raises that will never reach airdrop scale.
+# FHE exception kept at $5M (rare category, smaller raises still valid).
 _MIN_FUNDING = {
-    "Layer 1": 20_000_000, "Layer 2": 15_000_000,
-    "ZK/Privacy": 10_000_000, "FHE": 5_000_000,
-    "DePIN": 10_000_000, "AI/ML": 10_000_000,
-    "Payments": 15_000_000, "Gaming": 10_000_000,
-    "RWA": 8_000_000, "Restaking": 10_000_000,
-    "Modular": 10_000_000, "Infrastructure": 8_000_000,
-    "default": 5_000_000,
+    "Layer 1": 25_000_000, "Layer 2": 20_000_000,
+    "ZK/Privacy": 15_000_000, "FHE": 5_000_000,
+    "DePIN": 15_000_000, "AI/ML": 15_000_000,
+    "Payments": 20_000_000, "Gaming": 15_000_000,
+    "RWA": 15_000_000, "Restaking": 15_000_000,
+    "Modular": 15_000_000, "Infrastructure": 15_000_000,
+    "default": 10_000_000,
 }
 
 
@@ -219,7 +222,7 @@ def scan_defillama(scan_id: str = "") -> list[dict]:
         amount = float(r.get("amount", 0) or 0) * 1_000_000
         age_days = _days_since(r.get("date", 0))
 
-        if age_days > 730:
+        if age_days > 365:  # v1.0: tightened from 730 — 2yr-old raises are likely launched
             continue
 
         desc = " ".join(str(p) for p in [
@@ -459,7 +462,11 @@ def run_funding_scan(scan_id: str = "") -> list[dict]:
     # Pre-score using cached data only (no API calls) to cut candidates
     # before expensive CoinGecko checks. Projects with no VC, no funding,
     # and no novel tech will never score above threshold regardless of token status.
-    PRE_SCORE_MIN = 2.0  # Below this even a top VC caller wouldn't push it above 5
+    # v1.0: raised from 2.0 to 3.5 — at 2.0 almost all 544 candidates
+    # passed, causing 6h+ scans due to CoinGecko rate limiting.
+    # At 3.5: only projects with real VC (tier-2+) OR $20M+ funding
+    # reach the token check. Expected: 544 → ~80-100 candidates.
+    PRE_SCORE_MIN = 3.5
 
     results = []
     skipped_pre = 0
