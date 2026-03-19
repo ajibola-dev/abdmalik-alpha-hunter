@@ -114,6 +114,13 @@ def run_scan_cycle_async():
     candidates = score_stage(candidates, scan_id)
     genesis_count = alert_stage(candidates, scan_id)
 
+    # Record heartbeat so watchdog knows the scan completed
+    try:
+        from modules.watchdog import record_heartbeat
+        record_heartbeat()
+    except Exception:
+        pass
+
     logger.info("=" * 60)
     logger.info("✅ [%s] Async scan complete — %d genesis calls",
                 scan_id, genesis_count)
