@@ -1,314 +1,311 @@
 """
-modules/github_scanner.py
-Scans GitHub for technical signals BEFORE they appear on Twitter.
+modules/github_scanner.py — v2.0
 
-v0.5 changes:
-  - _get() replaced with _http_get() — reads MAX_RETRIES and
-    RETRY_BACKOFF_BASE from settings, identical to other modules.
-    Was hardcoded retries=3; 403 rate-limit handling preserved.
-  - Structured logging: every log line now includes scan_id and
-    project_name where relevant.
-  - scan_github() and run_github_scan() accept scan_id parameter
-    propagated from pipeline.run_github_scan_cycle().
-  - _make_scan_id() imported from pipeline for consistent IDs.
-  - __import__('json') inline replaced with top-level import.
+Finds new testnet repos from serious teams in the 4 verticals.
+This is the autonomous signal source — no Twitter needed.
 
-What we look for (unchanged):
-  - New testnet repos published in last 30 days
-  - Node/validator programs with recent activity
-  - ZK/FHE/DePIN/AI projects with fresh commits
-  - Repos with airdrop eligibility signals in README
+The pattern: Jito, Starknet, Celestia all had GitHub activity
+months before mainstream Twitter coverage. This scanner catches
+that window.
+
+Search queries per vertical:
+  ZK/L2:       "testnet" in:readme language:python OR language:rust
+  PerpDEX:     "perpetual" OR "perp" testnet topic:defi
+  Solana DeFi: "solana" testnet points-program
+  Cosmos/DA:   "cosmos" OR "celestia" testnet validator
 """
-import json
 import logging
 import time
 import requests
 from datetime import datetime, timezone
 from config.settings import settings
-from modules.database import upsert_project, save_score, log_scan
+from modules import database as db
 
 logger = logging.getLogger(__name__)
 
 _SESSION = requests.Session()
 
-# ── GitHub search queries ──────────────────────────────────────────────────
+_GITHUB_QUERIES = {
+    "zk_l2": [
+        "zkvm testnet",
+        "zk rollup testnet incentivized",
+        "starknet compatible testnet",
+        "fhe blockchain testnet",
+        "zero knowledge testnet validator",
+    ],
+    "perpdex": [
+        "perpetual dex testnet points",
+        "perp protocol testnet incentive",
+        "onchain perpetual trading testnet",
+    ],
+    "solana_defi": [
+        "solana defi testnet points program",
+        "solana lp incentive testnet",
+        "svm testnet airdrop",
+    ],
+    "cosmos_da": [
+        "cosmos data availability testnet",
+        "celestia rollup testnet validator",
+        "modular blockchain testnet ibc",
+        "cosmos chain testnet incentivized",
+    ],
+}
 
-_GITHUB_QUERIES = [
-    "blockchain testnet validator 2025",
-    "layer1 testnet node operator 2025",
-    "zkvm testnet launch 2025",
-    "fhe blockchain homomorphic 2025",
-    "depin node operator testnet",
-    "zk proof system testnet validator",
-    "ai blockchain inference testnet",
-    "restaking avs operator 2025",
-    "airdrop eligibility testnet participation",
-    "node operator airdrop incentive",
+# Funds with airdrop track record — boost signal if in repo description
+_SIGNAL_FUNDS = [
+    "paradigm", "a16z", "multicoin", "polychain", "dragonfly",
+    "electric capital", "binance labs", "coinbase ventures",
+    "1kx", "hack vc",
 ]
 
-_SERIOUS_SIGNALS = [
-    "testnet", "validator", "node operator", "mainnet", "zkp",
-    "fhe", "depin", "layer 1", "l1 blockchain", "zk rollup",
-    "restaking", "modular blockchain", "consensus", "prover",
-]
-
-_NOISE_SIGNALS = [
-    "tutorial", "example", "demo", "sample", "boilerplate",
-    "learn", "course", "workshop", "test", "practice",
-    "fork of", "clone of",
-]
+_GENESIS_THRESHOLD = 5.0  # Minimum score to alert
 
 
-# ── Shared HTTP helper (settings-driven retry + backoff) ──────────────────
-
-def _http_get(url, params=None, scan_id=""):
-    """
-    Standardised GET for GitHub API with exponential backoff.
-    v0.5: reads MAX_RETRIES and RETRY_BACKOFF_BASE from settings.
-    Handles 403 rate-limit with a 60s pause (GitHub-specific).
-    Always attaches GITHUB_TOKEN if available.
-    """
+def _get_headers() -> dict:
     headers = {"Accept": "application/vnd.github.v3+json"}
     if settings.GITHUB_TOKEN:
         headers["Authorization"] = f"token {settings.GITHUB_TOKEN}"
-
-    for attempt in range(settings.MAX_RETRIES):
-        try:
-            r = _SESSION.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=settings.REQUEST_TIMEOUT,
-            )
-            if r.status_code == 403:
-                wait = 60 * (attempt + 1)
-                logger.warning(
-                    "[%s] GitHub rate limited — sleeping %ds (attempt %d/%d)",
-                    scan_id, wait, attempt + 1, settings.MAX_RETRIES
-                )
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r
-        except Exception as exc:
-            wait = settings.RETRY_BACKOFF_BASE ** attempt
-            if attempt < settings.MAX_RETRIES - 1:
-                logger.debug(
-                    "[%s] GitHub GET failed (attempt %d/%d): %s — retry in %ds",
-                    scan_id, attempt + 1, settings.MAX_RETRIES, exc, wait
-                )
-                time.sleep(wait)
-            else:
-                logger.debug(
-                    "[%s] GitHub GET failed after %d attempts: %s",
-                    scan_id, settings.MAX_RETRIES, exc
-                )
-    return None
+    return headers
 
 
-# ── Repo scoring ───────────────────────────────────────────────────────────
-
-def _days_since_update(updated_at: str) -> int:
+def _search_repos(query: str, vertical: str) -> list[dict]:
+    """Search GitHub repos for a query."""
     try:
-        dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-        return (datetime.now(timezone.utc) - dt).days
-    except Exception:
-        return 9999
-
-
-def _score_repo(repo: dict) -> float:
-    """Score a GitHub repo 0-10 for relevance."""
-    score = 0.0
-    desc = (repo.get("description") or "").lower()
-    name = (repo.get("name") or "").lower()
-    topics = [t.lower() for t in repo.get("topics", [])]
-    all_text = f"{desc} {name} {' '.join(topics)}"
-
-    if any(n in all_text for n in _NOISE_SIGNALS):
-        return 0.0
-
-    hits = sum(1 for s in _SERIOUS_SIGNALS if s in all_text)
-    score += min(hits * 2.0, 6.0)
-
-    stars = repo.get("stargazers_count", 0)
-    if stars >= 500:
-        score += 2.0
-    elif stars >= 100:
-        score += 1.0
-    elif stars >= 20:
-        score += 0.5
-
-    days = _days_since_update(repo.get("updated_at", ""))
-    if days <= 7:
-        score += 2.0
-    elif days <= 30:
-        score += 1.0
-
-    return min(score, 10.0)
-
-
-def _extract_org_name(repo: dict) -> str:
-    full_name = repo.get("full_name", "")
-    owner = full_name.split("/")[0] if "/" in full_name else ""
-    if repo.get("owner", {}).get("type") == "Organization":
-        return owner
-    return repo.get("name", "").replace("-", " ").replace("_", " ").title()
-
-
-# ── Main GitHub scan ───────────────────────────────────────────────────────
-
-def scan_github(scan_id: str = "") -> list[dict]:
-    """
-    Scan GitHub for early-stage blockchain projects.
-    v0.5: scan_id propagated through all log lines.
-    """
-    candidates = {}
-
-    for query in _GITHUB_QUERIES:
-        logger.debug("[%s] GitHub query: %s", scan_id, query)
-        resp = _http_get(
+        resp = _SESSION.get(
             "https://api.github.com/search/repositories",
-            params={"q": query, "sort": "updated", "order": "desc", "per_page": 10},
-            scan_id=scan_id,
+            params={
+                "q": query,
+                "sort": "updated",
+                "order": "desc",
+                "per_page": 10,
+            },
+            headers=_get_headers(),
+            timeout=settings.REQUEST_TIMEOUT,
         )
-        if resp is None:
+        if resp.status_code == 403:
+            logger.warning("GitHub rate limited")
+            time.sleep(60)
+            return []
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+    except Exception as exc:
+        logger.debug("GitHub search error: %s", exc)
+        return []
+
+    results = []
+    for repo in items:
+        # Skip repos older than 12 months
+        pushed = repo.get("pushed_at", "")
+        try:
+            dt = datetime.fromisoformat(pushed.replace("Z", "+00:00"))
+            days_old = (datetime.now(timezone.utc) - dt).days
+            if days_old > 365:
+                continue
+        except Exception:
             continue
 
+        # Skip very new repos with no stars (likely noise)
+        stars = repo.get("stargazers_count", 0)
+        created = repo.get("created_at", "")
         try:
-            items = resp.json().get("items", [])
-            for repo in items:
-                repo_score = _score_repo(repo)
-                if repo_score < 4.0:
-                    continue
+            dt_created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - dt_created).days
+        except Exception:
+            age_days = 999
 
-                org_name = _extract_org_name(repo)
-                if not org_name:
-                    continue
+        # Filter: must have some traction OR be very recent
+        if stars < 5 and age_days > 60:
+            continue
 
-                if (org_name not in candidates or
-                        repo_score > candidates[org_name]["repo_score"]):
+        # Skip repos that are clearly forks of known projects
+        if repo.get("fork", False):
+            continue
 
-                    desc = repo.get("description") or ""
-                    topics = repo.get("topics", [])
-                    combined = desc + " " + " ".join(topics)
+        description = (repo.get("description", "") or "").lower()
+        topics = repo.get("topics", [])
 
-                    from modules.funding_scanner import _detect_category
-                    from modules.researcher import _detect_novel_tech, _detect_testnet
+        results.append({
+            "name": repo.get("name", ""),
+            "full_name": repo.get("full_name", ""),
+            "description": repo.get("description", "") or "",
+            "url": repo.get("html_url", ""),
+            "stars": stars,
+            "days_since_commit": days_old,
+            "age_days": age_days,
+            "topics": topics,
+            "vertical": vertical,
+            "query": query,
+        })
 
-                    category = _detect_category(combined)
-                    novel_tech = _detect_novel_tech(combined)
-                    testnet = _detect_testnet(combined)
+    return results
 
-                    candidates[org_name] = {
-                        "name": org_name,
-                        "funding_usd": 0,
-                        "investors": "",
-                        "category": category,
-                        "website": repo.get("homepage") or "",
-                        "github": repo.get("html_url", ""),
-                        "description": desc[:300],
-                        "source": "github",
-                        "novel_tech": novel_tech,
-                        "testnet_active": testnet,
-                        "has_token": False,
-                        "stars": repo.get("stargazers_count", 0),
-                        "repo_score": repo_score,
-                        "last_commit": repo.get("updated_at", "")[:10],
-                    }
 
-                    logger.debug(
-                        "[%s] GitHub candidate project='%s' "
-                        "stars=%d repo_score=%.1f",
-                        scan_id, org_name,
-                        repo.get("stargazers_count", 0), repo_score
-                    )
+def _score_github_project(repo: dict) -> float:
+    """
+    Score a GitHub-discovered project.
+    Uses same pattern-matching logic as scorer.py but adapted for
+    GitHub-only data (no tweet context).
+    """
+    score = 0.0
+    desc = repo.get("description", "").lower()
+    topics = [t.lower() for t in repo.get("topics", [])]
+    all_text = desc + " " + " ".join(topics)
+    vertical = repo.get("vertical", "infrastructure")
 
-        except Exception as exc:
-            logger.error("[%s] GitHub query error query='%s': %s",
-                         scan_id, query, exc)
+    # Vertical score
+    vertical_scores = {
+        "zk_l2": 6, "perpdex": 6, "solana_defi": 4,
+        "cosmos_da": 4, "infrastructure": 2,
+    }
+    score += vertical_scores.get(vertical, 2)
 
-        time.sleep(3)
+    # Testnet signal in description/topics
+    testnet_words = ["testnet", "devnet", "incentivized", "validator",
+                     "node", "prover", "points"]
+    if any(w in all_text for w in testnet_words):
+        score += 4
 
-    logger.info("[%s] GitHub scan: %d unique orgs found",
-                scan_id, len(candidates))
-    return list(candidates.values())
+    # Backed by serious fund (mentioned in description)
+    for fund in _SIGNAL_FUNDS:
+        if fund in all_text:
+            score += 3
+            break
+
+    # Recency bonus
+    days = repo.get("days_since_commit", 999)
+    if days < 7:
+        score += 3
+    elif days < 30:
+        score += 2
+    elif days < 90:
+        score += 1
+
+    # Stars as social proof
+    stars = repo.get("stars", 0)
+    if stars > 500:
+        score += 2
+    elif stars > 100:
+        score += 1
+
+    # Age sweet spot: 3-18 months
+    age = repo.get("age_days", 999)
+    if 90 <= age <= 540:
+        score += 1
+
+    return round(score, 1)
 
 
 def run_github_scan(scan_id: str = "") -> list[dict]:
     """
-    Full GitHub scan pipeline with scoring and DB persistence.
-    v0.5: scan_id propagated, structured log context throughout.
+    Run GitHub scan across all 4 verticals.
+    Returns list of qualifying projects.
     """
-    from modules.scorer import score_project
     from modules.researcher import check_token_live
-
-    if not scan_id:
-        from modules.pipeline import _make_scan_id
-        scan_id = _make_scan_id()
+    from modules.action_planner import format_farming_brief_for_telegram
+    from modules.scorer import FarmingBrief
+    from modules.telegram_bot import send_message
 
     logger.info("[%s] ── GitHub Scanner starting ──────────────", scan_id)
 
-    candidates = scan_github(scan_id=scan_id)
-    results = []
+    all_repos = {}
 
-    for project in candidates:
-        name = project["name"]
-        try:
-            time.sleep(1.5)
+    for vertical, queries in _GITHUB_QUERIES.items():
+        for query in queries:
+            time.sleep(3)  # Gentle GitHub rate limiting
+            repos = _search_repos(query, vertical)
+            for repo in repos:
+                key = repo["full_name"]
+                if key not in all_repos:
+                    all_repos[key] = repo
+                    logger.debug("[%s] Found: %s (%s)",
+                                 scan_id, repo["name"], vertical)
 
-            if check_token_live(name):
-                logger.debug(
-                    "[%s] project='%s' token live — skipping", scan_id, name
-                )
-                continue
+    logger.info("[%s] GitHub scan: %d unique repos found",
+                scan_id, len(all_repos))
 
-            score_result = score_project(project, caller_tier=2, caller_count=1)
+    qualified = []
+    alerts_sent = 0
 
-            logger.info(
-                "[%s] github scored project='%s' score=%.1f label='%s'",
-                scan_id, name, score_result.score, score_result.label
+    for full_name, repo in all_repos.items():
+        name = repo["name"]
+        score = _score_github_project(repo)
+
+        if score < _GENESIS_THRESHOLD:
+            continue
+
+        # Token check
+        time.sleep(1)
+        if check_token_live(name):
+            logger.info("[%s] '%s' token live — skip", scan_id, name)
+            continue
+
+        logger.info("[%s] GitHub qualified: '%s' score=%.1f vertical=%s",
+                    scan_id, name, score, repo["vertical"])
+
+        # Store in DB
+        project_id = db.upsert_project(
+            name=name,
+            mentioned_by="[github]",
+            tweet_url=repo["url"],
+            tweet_text=repo["description"],
+            category=repo["vertical"],
+            funding_usd=0,
+            investors="",
+            has_token=False,
+            testnet_active=True,
+            website="",
+            github=repo["url"],
+            description=repo["description"],
+        )
+        db.save_score(
+            project_id=project_id,
+            score=score,
+            breakdown="{}",
+            label="WATCH CLOSELY" if score >= 8 else "MONITOR",
+        )
+
+        if not db.already_alerted(project_id, "github"):
+            # Build a simple farming brief for GitHub-discovered projects
+            brief = FarmingBrief(
+                project_name=name,
+                vertical=repo["vertical"],
+                conviction="WATCH CLOSELY" if score >= 8 else "MONITOR",
+                why=f"GitHub active ({repo['days_since_commit']}d ago). "
+                    f"{repo['description'][:100]}",
+                window="Early — check for Discord and Galxe status.",
+                actions=[
+                    f"Visit {repo['url']} and read the README",
+                    "Find their official Twitter/Discord",
+                    "Check if testnet is open and interact immediately",
+                    "Look for any points/farming program in docs",
+                ],
+                wallet_count=2 if score >= 8 else 1,
+                zero_cost=True,
+                red_flags=[],
+                raw_signals={"source": "github", "score": score},
             )
 
-            project_id = upsert_project(
-                name=name,
-                mentioned_by="[github]",
-                tweet_url=project.get("github", ""),
-                tweet_text="",
-                category=project["category"],
-                funding_usd=0,
-                investors="",
-                has_token=False,
-                testnet_active=project["testnet_active"],
-                website=project["website"],
-                github=project["github"],
-                description=project["description"],
-            )
-            save_score(
-                project_id=project_id,
-                score=score_result.score,
-                breakdown=json.dumps(score_result.breakdown),
-                label=score_result.label,
-            )
+            project_for_alert = {
+                "name": name,
+                "mentioned_by": "[github]",
+                "tweet_url": repo["url"],
+                "tweet_text": repo["description"],
+                "funding_usd": 0,
+                "investors": "",
+            }
 
-            results.append({
-                "project": project,
-                "project_id": project_id,
-                "score_result": score_result,
-            })
+            message = (
+                "⚙️ <b>ALPHA HUNTER — GITHUB SIGNAL</b>\n"
+                f"<i>Found via GitHub scan — {repo['vertical'].upper()} vertical</i>\n\n"
+            ) + format_farming_brief_for_telegram(brief, project_for_alert)
 
-        except Exception as exc:
-            logger.error(
-                "[%s] GitHub scan error project='%s': %s", scan_id, name, exc
-            )
+            if send_message(message):
+                db.log_alert(project_id, "github")
+                alerts_sent += 1
 
-    qualified = [
-        r for r in results
-        if r["score_result"].score >= settings.GENESIS_THRESHOLD
-    ]
+        qualified.append(repo)
 
-    logger.info(
-        "[%s] GitHub scan complete — total=%d qualified=%d (threshold=%d)",
-        scan_id, len(results), len(qualified), settings.GENESIS_THRESHOLD
-    )
-    log_scan("github_scanner", len(qualified), notes=f"scan_id={scan_id}")
+    logger.info("[%s] GitHub scan complete — total=%d qualified=%d alerts=%d",
+                scan_id, len(all_repos), len(qualified), alerts_sent)
+    db.log_scan("github_scanner", alerts_sent, notes=f"scan_id={scan_id}")
     return qualified

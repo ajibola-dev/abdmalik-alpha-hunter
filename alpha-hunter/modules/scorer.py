@@ -1,246 +1,412 @@
 """
-modules/scorer.py
-Scores projects using the Zun Method.
+modules/scorer.py — v2.0
 
-v0.8 changes:
-  - Testnet weight increased: 0.09 → 0.12 (your core use case is testnet farming)
-  - novel_tech weight stays at 0.22 — tech IS the differentiator
-  - funding weight: 0.19 → 0.17 (funding alone doesn't make an airdrop)
-  - no_token weight: 0.15 → 0.17 (pre-token is the core requirement)
-  - caller_quality: 0.08 → 0.07 (slight reduction to accommodate testnet)
-  - Weights still sum to 1.0 ✓
-  - Testnet active + no token + any VC now reliably produces GENESIS CALL
-  - Tech scoring expanded for new categories (modular, rwa, payments)
-  - Added "incentivized testnet" as high-value signal (direct airdrop signal)
+Rebuilt from scratch. No more arbitrary weighted scoring.
 
-  Updated back-test with v0.8 weights:
-    Zama (FHE, Paradigm, testnet)         → 9.0/10 ✅
-    Story Protocol (a16z, IP/L1, testnet) → 8.4/10 ✅
-    Boundless (ZK, $20M, testnet)         → 7.8/10 ✅
-    miden ($25M, a16z, ZK, testnet)       → 7.2/10 ✅ (was 5.5 — now GENESIS CALL)
-    Kaito (Binance Labs, AI-social)        → 6.9/10 ✅
+The question is simple:
+  "Does this project match the pattern of projects that gave
+   real, substantial airdrops to early farmers?"
+
+Historical pattern (Starknet, Hyperliquid, Jito, Celestia, Arbitrum,
+Optimism, Wormhole, EigenLayer, dYdX, Blur):
+
+  MUST HAVE (disqualify if missing):
+    - No live token yet
+    - Active testnet OR points program running
+
+  STRONG SIGNALS (the more the better):
+    - Under 50K Discord/community (early window)
+    - Backed by serious funds with airdrop track record
+    - Technical interaction required (not just clicking)
+    - ZK/L2, PerpDEX, Solana DeFi, or Cosmos/DA vertical
+    - Pre-Galxe (no active Galxe campaign yet)
+    - GitHub activity in last 90 days
+    - 3-18 month old project (not brand new, not too old)
+
+  KILL SIGNALS (disqualify immediately):
+    - Token already live
+    - Mainnet launched without farming program
+    - Galxe campaign already has 100K+ participants
+    - Project is over 24 months old with no token news
 """
 import logging
 from dataclasses import dataclass, field
-from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Calibrated weights v0.8 (must sum to 1.0) ─────────────────────────────
-_WEIGHTS = {
-    "vc_quality":     0.25,   # strongest single predictor — unchanged
-    "novel_tech":     0.22,   # tech differentiator — unchanged
-    "no_token":       0.17,   # +0.02 — pre-token IS the requirement
-    "testnet":        0.12,   # +0.03 — testnet farming is the core use case
-    "funding":        0.17,   # -0.02 — funding alone ≠ airdrop
-    "caller_quality": 0.05,   # -0.02 — signal quality matters less than tech
-    "multi_caller":   0.02,   # unchanged
+# Funds with proven airdrop track record
+_AIRDROP_TRACK_RECORD_FUNDS = [
+    # Tier S — consistently produced massive airdrops
+    "paradigm", "a16z", "andreessen horowitz", "multicoin",
+    "polychain", "electric capital", "dragonfly",
+    # Tier A — produced good airdrops
+    "binance labs", "coinbase ventures", "sequoia", "pantera",
+    "framework ventures", "delphi digital", "spartan",
+    "1kx", "hack vc", "multicoin capital",
+    # Notable for specific verticals
+    "celestia", "cosmos", "osmosis",  # Cosmos ecosystem
+    "solana ventures", "jump crypto",  # Solana ecosystem
+]
+
+# Verticals that have historically produced the biggest airdrops
+_HIGH_VALUE_VERTICALS = {
+    "zk_l2": 3,        # Starknet $120k, zkSync, Linea, Scroll, Taiko
+    "perpdex": 3,       # Hyperliquid lifechanging, dYdX, GMX
+    "solana_defi": 2,   # Jito, Tensor, Meteora, Jupiter
+    "cosmos_da": 2,     # Celestia, Dymension, Osmosis, Neutron
+    "interop": 2,       # Wormhole, LayerZero, Axelar
+    "restaking": 2,     # EigenLayer, Symbiotic
+    "infrastructure": 1,
 }
-assert abs(sum(_WEIGHTS.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
 
 
 @dataclass
-class ScoreResult:
-    score: float
-    label: str
-    breakdown: dict
-    verdict: str
-    raw_scores: dict = field(default_factory=dict)
+class FarmingBrief:
+    """What the bot returns — not a score, a farming brief."""
+    project_name: str
+    vertical: str
+    conviction: str        # GRIND NOW / WATCH / SKIP
+    why: str               # 1-2 sentences: why this fits the pattern
+    window: str            # How long before the window closes
+    actions: list[str]     # Exactly what to do today
+    wallet_count: int      # How many wallets to run
+    zero_cost: bool        # Can farm with zero capital?
+    red_flags: list[str]   # Anything concerning
+    raw_signals: dict = field(default_factory=dict)
 
 
-def _count_top_vcs(investors: str) -> int:
-    lower = investors.lower()
-    return sum(1 for vc in settings.TOP_TIER_VCS if vc in lower)
-
-
-def _vc_raw_score(investors: str) -> float:
+def evaluate_project(project: dict, caller_tier: int = 2,
+                     caller_weight: float = 1.0) -> FarmingBrief:
     """
-    v0.9.7: empty investors string returns 1.0 not 0.0.
-    Unknown backing ≠ no backing. Many backed projects aren't in DeFiLlama.
+    v2.0: Pattern match against historical airdrop criteria.
+    Returns a farming brief, not a score.
     """
-    count = _count_top_vcs(investors)
-    if count >= 3:
-        return 10.0
-    elif count == 2:
-        return 8.0
-    elif count == 1:
-        return 6.0
-    lower = investors.lower()
-    tier2 = ["animoca", "ygg", "merit circle", "delphi", "spartan",
-             "hashkey", "okx ventures", "galaxy", "hack vc", "lightspeed",
-             "1kx", "finality", "symbolic"]
-    if any(v in lower for v in tier2):
-        return 3.0
-    # No investors found — unknown, not confirmed unbacked
-    if not investors.strip():
-        return 1.0
-    return 0.5
+    name = project.get("name", "Unknown")
+    investors = (project.get("investors", "") or "").lower()
+    funding = project.get("funding_usd", 0) or 0
+    has_token = project.get("has_token", False)
+    testnet = project.get("testnet_active", False)
+    novel_tech = [t.lower() for t in (project.get("novel_tech", []) or [])]
+    category = (project.get("category", "") or "").lower()
+    discord_size = project.get("discord_size", None)
+    has_galxe = project.get("has_galxe", False)
+    github_days = project.get("github_days_since_commit", 999)
+    project_age_days = project.get("project_age_days", 999)
+    tweet_text = (project.get("tweet_text", "") or "").lower()
+    mentioned_by = project.get("mentioned_by", "")
 
+    signals = {}
+    red_flags = []
 
-def _tech_raw_score(novel_tech: list) -> float:
-    """
-    v0.8: expanded tech value tiers.
-    high = 4pts each, medium = 2pts each, standard = 1pt each.
-    """
-    high_value = [
-        "fhe", "zero knowledge", "zkvm",
-        "shared security", "restaking",
-    ]
-    medium_value = [
-        "depin", "ai blockchain", "modular",
-        "intent based", "account abstraction",
-        "social graph", "identity",
-    ]
-    standard_value = [
-        "rwa", "payments", "layer 1", "layer 2",
-        "privacy", "mpc",
-    ]
-
-    score = 0.0
-    tech_str = " ".join(novel_tech).lower()
-
-    for t in high_value:
-        if t in tech_str:
-            score += 4.0
-    for t in medium_value:
-        if t in tech_str:
-            score += 2.0
-    for t in standard_value:
-        if t in tech_str:
-            score += 1.0
-
-    return min(score, 10.0)
-
-
-def _funding_raw_score(funding_usd: float) -> float:
-    """
-    v0.9.7: funding=0 now returns 1.5 (unknown) not 0.0 (confirmed unfunded).
-    Many legitimate pre-seed projects simply aren't in DeFiLlama yet.
-    Confirmed zero funding should be treated differently from missing data —
-    but we can't distinguish them here, so we give benefit of the doubt.
-    """
-    if funding_usd >= 200_000_000:
-        return 10.0
-    elif funding_usd >= 100_000_000:
-        return 8.5
-    elif funding_usd >= 50_000_000:
-        return 7.0
-    elif funding_usd >= 20_000_000:
-        return 5.0
-    elif funding_usd >= 5_000_000:
-        return 2.5
-    elif funding_usd > 0:
-        return 1.5
-    # funding=0 means not found in DeFiLlama — unknown, not confirmed zero
-    return 1.0
-
-
-def _testnet_raw_score(project: dict) -> float:
-    """
-    v0.8: testnet scoring is nuanced — incentivized testnet scores higher.
-    Active testnet = 10.0, mentioned testnet = 7.0, no testnet = 0.0.
-    """
-    if not project.get("testnet_active"):
-        return 0.0
-    # Check if incentivized testnet mentioned in research notes
-    notes = " ".join(project.get("research_notes", [])).lower()
-    tweet = project.get("tweet_text", "").lower()
-    if any(x in notes + tweet for x in
-           ["incentivized", "incentivised", "rewards", "points", "eligible"]):
-        return 10.0
-    return 8.0
-
-
-def _caller_quality_raw(caller_tier: int, caller_weight: float = 1.0) -> float:
-    if caller_tier == 1:
-        base = 10.0
-    elif caller_tier == 2:
-        base = 5.0
-    else:
-        base = 2.0
-    return round(base * caller_weight, 2)
-
-
-def score_project(project: dict, caller_tier: int = 2,
-                  caller_count: int = 1,  # always 1 currently — reserved for multi-caller
-                  caller_weight: float = 1.0) -> ScoreResult:
-    """Score a project 0-10 using calibrated Zun Method weights."""
-    investors  = project.get("investors", "") or ""
-    funding    = project.get("funding_usd", 0) or 0
-    has_token  = project.get("has_token", False)
-    novel_tech = project.get("novel_tech", []) or []
-
+    # ── KILL SIGNALS ─────────────────────────────────────────────────────
     if has_token:
-        return ScoreResult(
-            score=0.0,
-            label="Token Live ❌",
-            breakdown={"disqualified": "Token already live on CoinGecko"},
-            verdict="Skip — token already launched.",
-            raw_scores={},
+        return FarmingBrief(
+            project_name=name,
+            vertical="unknown",
+            conviction="SKIP",
+            why="Token already live. Farming window is closed.",
+            window="Closed",
+            actions=[],
+            wallet_count=0,
+            zero_cost=True,
+            red_flags=["Token live"],
+            raw_signals={"kill": "token_live"}
         )
 
-    # v0.9.3: autonomous sources (DeFiLlama, GitHub, CoinGecko) pass
-    # caller_tier=0 to signal "no human caller". In this case caller_quality
-    # and multi_caller are zeroed out and their weights redistributed to
-    # funding + vc_quality so the project is judged purely on its signals.
-    # This prevents autonomous finds from being artificially capped at ~5.0.
-    mentioned_by = project.get("mentioned_by", "")
-    is_autonomous = (
-        caller_tier == 0 or
-        (mentioned_by and mentioned_by.startswith("["))
+    # ── DETECT VERTICAL ──────────────────────────────────────────────────
+    vertical = _detect_vertical(novel_tech, category, tweet_text, investors)
+    vertical_score = _HIGH_VALUE_VERTICALS.get(vertical, 0)
+    signals["vertical"] = vertical
+    signals["vertical_score"] = vertical_score
+
+    # ── BACKING QUALITY ──────────────────────────────────────────────────
+    backing_score = 0
+    matched_funds = []
+    for fund in _AIRDROP_TRACK_RECORD_FUNDS:
+        if fund in investors:
+            backing_score += 1
+            matched_funds.append(fund)
+    backing_score = min(backing_score, 3)
+    signals["backing_score"] = backing_score
+    signals["matched_funds"] = matched_funds
+
+    # ── EARLY WINDOW SIGNALS ─────────────────────────────────────────────
+    early_score = 0
+
+    # Under 50K Discord = early window still open
+    if discord_size is not None:
+        if discord_size < 10_000:
+            early_score += 3
+            signals["discord"] = f"{discord_size} (VERY early)"
+        elif discord_size < 50_000:
+            early_score += 2
+            signals["discord"] = f"{discord_size} (early)"
+        elif discord_size < 200_000:
+            early_score += 1
+            signals["discord"] = f"{discord_size} (growing)"
+        else:
+            red_flags.append(f"Large community ({discord_size}) — window may be closing")
+    else:
+        # No Discord yet = extremely early
+        early_score += 3
+        signals["discord"] = "No Discord yet — extremely early"
+
+    # No Galxe campaign = pre-hype
+    if not has_galxe:
+        early_score += 2
+        signals["galxe"] = "No Galxe campaign yet"
+    else:
+        early_score += 0
+        signals["galxe"] = "Galxe campaign exists"
+        if discord_size and discord_size > 100_000:
+            red_flags.append("Galxe + large community = retail already here")
+
+    # GitHub active
+    if github_days < 30:
+        early_score += 2
+        signals["github"] = f"Active ({github_days} days since commit)"
+    elif github_days < 90:
+        early_score += 1
+        signals["github"] = f"Recent ({github_days} days since commit)"
+    else:
+        red_flags.append(f"GitHub inactive ({github_days} days) — team may have stalled")
+
+    # Project age — sweet spot is 3-18 months
+    if 90 <= project_age_days <= 540:
+        early_score += 1
+        signals["age"] = f"{project_age_days // 30} months old (sweet spot)"
+    elif project_age_days > 720:
+        red_flags.append(f"Project is {project_age_days // 30} months old — why no token yet?")
+
+    signals["early_score"] = early_score
+
+    # ── TESTNET / FARMING PROGRAM ────────────────────────────────────────
+    farming_score = 0
+    if testnet:
+        farming_score += 3
+        signals["testnet"] = "Active testnet"
+    else:
+        red_flags.append("No testnet detected — nothing to farm yet")
+
+    # Technical interaction required = dev edge
+    tech_required = _requires_technical_interaction(novel_tech, tweet_text)
+    if tech_required:
+        farming_score += 2
+        signals["tech_required"] = "Technical interaction required — dev edge applies"
+    signals["farming_score"] = farming_score
+
+    # ── CALLER QUALITY ───────────────────────────────────────────────────
+    caller_score = 0
+    if caller_tier == 1:
+        caller_score = round(3 * caller_weight, 1)
+    elif caller_tier == 2:
+        caller_score = round(1.5 * caller_weight, 1)
+    signals["caller_score"] = caller_score
+
+    # ── CONVICTION DECISION ──────────────────────────────────────────────
+    total = (
+        vertical_score * 2 +
+        backing_score * 2 +
+        early_score +
+        farming_score +
+        caller_score
     )
+    signals["total"] = round(total, 1)
 
-    if is_autonomous:
-        # Pure signal scoring — no caller penalty
-        raw = {
-            "vc_quality":     _vc_raw_score(investors),
-            "novel_tech":     _tech_raw_score(novel_tech),
-            "no_token":       10.0 if not has_token else 0.0,
-            "testnet":        _testnet_raw_score(project),
-            "funding":        _funding_raw_score(funding),
-            "caller_quality": 5.0,    # neutral — not penalised
-            "multi_caller":   0.0,
-        }
+    critical_missing = []
+    if not testnet:
+        critical_missing.append("no testnet")
+    if backing_score == 0 and funding < 5_000_000:
+        critical_missing.append("no backing/funding")
+
+    if total >= 16 and not critical_missing:
+        conviction = "GRIND NOW"
+    elif total >= 10 and len(critical_missing) <= 1:
+        conviction = "WATCH CLOSELY"
+    elif total >= 6:
+        conviction = "MONITOR"
     else:
-        raw = {
-            "vc_quality":     _vc_raw_score(investors),
-            "novel_tech":     _tech_raw_score(novel_tech),
-            "no_token":       10.0 if not has_token else 0.0,
-            "testnet":        _testnet_raw_score(project),
-            "funding":        _funding_raw_score(funding),
-            "caller_quality": _caller_quality_raw(caller_tier, caller_weight),
-            "multi_caller":   10.0 if caller_count >= 2 else 0.0,
-        }
+        conviction = "SKIP"
 
-    weighted_sum = sum(raw[k] * _WEIGHTS[k] for k in raw)
-    score = round(min(weighted_sum, 10.0), 1)
-    breakdown = {k: round(raw[k] * _WEIGHTS[k], 2) for k in raw}
+    # Override: if called by tier-1 account with no red flags, bump up
+    if caller_tier == 1 and conviction == "MONITOR" and len(red_flags) == 0:
+        conviction = "WATCH CLOSELY"
 
-    if score >= 8:
-        label   = "🔥 STRONG CONVICTION"
-        verdict = "Top priority — go deep immediately. Multi-wallet grind."
-    elif score >= 6.5:
-        label   = "⚡ GENESIS CALL"
-        verdict = "Strong signal — start grinding now."
-    elif score >= 5:
-        label   = "👀 WATCHING"
-        verdict = "Promising — monitor closely, light grind to start."
-    elif score >= 3:
-        label   = "🌱 EARLY SIGNAL"
-        verdict = "Too early to grind — add to watchlist and check back."
-    else:
-        label   = "❄️ WEAK SIGNAL"
-        verdict = "Not enough conviction. Skip unless new info emerges."
+    # ── BUILD FARMING BRIEF ──────────────────────────────────────────────
+    why = _build_why(name, vertical, backing_score, matched_funds,
+                      early_score, farming_score, tech_required, signals)
+    window = _estimate_window(discord_size, has_galxe, project_age_days)
+    actions = _build_actions(vertical, testnet, tech_required, funding)
+    wallet_count = _recommend_wallets(total, backing_score, vertical_score)
+    zero_cost = funding == 0 or testnet  # testnet = zero cost to interact
 
-    source_tag = "autonomous" if is_autonomous else f"caller_tier={caller_tier} w={caller_weight:.2f}"
     logger.info(
-        "Scored '%s': %.1f/10 [%s] "
-        "(VC:%.1f Tech:%.1f Testnet:%.1f Fund:%.1f | %s)",
-        project.get("name", "?"), score, label,
-        raw["vc_quality"], raw["novel_tech"], raw["testnet"],
-        raw["funding"], source_tag,
+        "FarmingBrief '%s': conviction=%s vertical=%s total=%.1f "
+        "backing=%d early=%d farming=%d caller=%.1f",
+        name, conviction, vertical, total,
+        backing_score, early_score, farming_score, caller_score
     )
 
-    return ScoreResult(score=score, label=label,
-                       breakdown=breakdown, verdict=verdict,
-                       raw_scores=raw)
+    return FarmingBrief(
+        project_name=name,
+        vertical=vertical,
+        conviction=conviction,
+        why=why,
+        window=window,
+        actions=actions,
+        wallet_count=wallet_count,
+        zero_cost=zero_cost,
+        red_flags=red_flags,
+        raw_signals=signals
+    )
+
+
+def _detect_vertical(novel_tech: list, category: str,
+                     tweet_text: str, investors: str) -> str:
+    combined = " ".join(novel_tech) + " " + category + " " + tweet_text
+
+    if any(x in combined for x in ["fhe", "zero knowledge", "zk", "zkvm",
+                                    "l2", "layer 2", "rollup", "starknet",
+                                    "zkync", "scroll", "linea", "taiko"]):
+        return "zk_l2"
+
+    if any(x in combined for x in ["perp", "perpetual", "dex", "trading",
+                                    "hyperliquid", "gmx", "drift", "vertex"]):
+        return "perpdex"
+
+    if any(x in combined for x in ["solana", "svm", "sol ", "jito",
+                                    "jupiter", "meteora", "raydium"]):
+        return "solana_defi"
+
+    if any(x in combined for x in ["cosmos", "celestia", "da layer",
+                                    "data availability", "ibc", "atom",
+                                    "dymension", "neutron", "osmosis"]):
+        return "cosmos_da"
+
+    if any(x in combined for x in ["bridge", "interop", "wormhole",
+                                    "layerzero", "axelar", "cross-chain"]):
+        return "interop"
+
+    if any(x in combined for x in ["restaking", "eigenlayer", "avs",
+                                    "shared security", "symbiotic"]):
+        return "restaking"
+
+    return "infrastructure"
+
+
+def _requires_technical_interaction(novel_tech: list, tweet_text: str) -> bool:
+    technical_signals = [
+        "deploy", "contract", "node", "validator", "prover",
+        "zk proof", "fhe", "zkvm", "run a node", "operator",
+        "lp", "liquidity", "stake", "bridge", "swap",
+    ]
+    combined = " ".join(novel_tech) + " " + tweet_text
+    return any(s in combined for s in technical_signals)
+
+
+def _build_why(name, vertical, backing_score, matched_funds,
+               early_score, farming_score, tech_required, signals) -> str:
+    parts = []
+
+    vertical_names = {
+        "zk_l2": "ZK/L2 (Starknet-pattern)",
+        "perpdex": "PerpDEX (Hyperliquid-pattern)",
+        "solana_defi": "Solana DeFi (Jito-pattern)",
+        "cosmos_da": "Cosmos/DA (Celestia-pattern)",
+        "interop": "Interop (Wormhole-pattern)",
+        "restaking": "Restaking (EigenLayer-pattern)",
+        "infrastructure": "Infrastructure",
+    }
+    parts.append(f"{vertical_names.get(vertical, vertical)} vertical")
+
+    if backing_score > 0 and matched_funds:
+        parts.append(f"backed by {matched_funds[0]}")
+
+    discord = signals.get("discord", "")
+    if "No Discord" in discord:
+        parts.append("no Discord yet — extremely early window")
+    elif "VERY early" in discord:
+        parts.append("tiny community — in the early window")
+    elif "early" in discord:
+        parts.append("community still small — window open")
+
+    if signals.get("galxe") == "No Galxe campaign yet":
+        parts.append("pre-Galxe")
+
+    if tech_required:
+        parts.append("technical interaction = dev edge")
+
+    return ". ".join(parts).capitalize() + "."
+
+
+def _estimate_window(discord_size, has_galxe, project_age_days) -> str:
+    if discord_size is None and not has_galxe:
+        return "Wide open — extremely early. Move now."
+    if discord_size and discord_size < 10_000 and not has_galxe:
+        return "Still early. 2-4 months before mainstream."
+    if discord_size and discord_size < 50_000 and not has_galxe:
+        return "Early-mid. 1-3 months of edge remaining."
+    if has_galxe:
+        return "Narrowing — Galxe exists. Still farmable if TVL/volume based."
+    return "Unknown — needs more data."
+
+
+def _build_actions(vertical: str, testnet: bool,
+                   tech_required: bool, funding: float) -> list[str]:
+    """Return the SMART farmer action list for this vertical."""
+    base = []
+
+    if not testnet:
+        return ["Wait — no testnet yet. Set alert for testnet launch. Do not touch yet."]
+
+    if vertical == "zk_l2":
+        base = [
+            "Deploy a simple contract or interact with deployed dApps on testnet",
+            "Bridge assets through the official bridge (even testnet tokens)",
+            "Use every deployed dApp at least once — swaps, lending, minting",
+            "Get Discord OG role the moment Discord opens",
+            "Run transactions across multiple days/weeks — consistency matters",
+            "If node program opens: run a node. This is the dev edge.",
+        ]
+    elif vertical == "perpdex":
+        base = [
+            "Start trading with real volume — even small amounts count",
+            "Provide liquidity in vaults if available (delta-neutral if possible)",
+            "Trade consistently over weeks — not one big session",
+            "Hold any ecosystem tokens if points are tied to holding",
+            "Use referral system if available",
+        ]
+    elif vertical == "solana_defi":
+        base = [
+            "Provide LP in primary pool (even small amount earns points)",
+            "Stake any available tokens — jitoSOL pattern",
+            "Use the protocol daily with real transactions",
+            "Join validator set if applicable",
+        ]
+    elif vertical == "cosmos_da":
+        base = [
+            "Stake native token with multiple validators (spread the stake)",
+            "Participate in governance — vote on every proposal",
+            "Run a light node or full node if technically accessible",
+            "Stay staked — don't unstake until after snapshot",
+        ]
+    else:
+        base = [
+            "Interact with the testnet daily — vary amounts and timing",
+            "Use every deployed contract/dApp",
+            "Get early community role (Discord/TG)",
+            "Bridge assets to/from testnet if bridge exists",
+        ]
+
+    return base
+
+
+def _recommend_wallets(total: float, backing_score: int,
+                       vertical_score: int) -> int:
+    if total >= 18 and backing_score >= 2:
+        return 5
+    elif total >= 14:
+        return 3
+    elif total >= 10:
+        return 2
+    return 1

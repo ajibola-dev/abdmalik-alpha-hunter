@@ -389,3 +389,38 @@ def complete_task(task_id: int):
         """, (task_id,))
 
 # ── Probation account management (v0.9.2) ─────────────────────────────────
+
+
+# ── Heartbeat (v2.0) ──────────────────────────────────────────────────────
+
+def update_heartbeat():
+    """Record that a scan completed successfully."""
+    with _conn() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS heartbeat (
+                id INTEGER PRIMARY KEY,
+                last_seen TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        existing = con.execute("SELECT id FROM heartbeat LIMIT 1").fetchone()
+        if existing:
+            con.execute("UPDATE heartbeat SET last_seen = datetime('now') WHERE id = ?",
+                        (existing[0],))
+        else:
+            con.execute("INSERT INTO heartbeat (last_seen) VALUES (datetime('now'))")
+
+
+def get_last_heartbeat() -> str | None:
+    """Return timestamp of last completed scan."""
+    try:
+        with _conn() as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS heartbeat (
+                    id INTEGER PRIMARY KEY,
+                    last_seen TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            row = con.execute("SELECT last_seen FROM heartbeat LIMIT 1").fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None

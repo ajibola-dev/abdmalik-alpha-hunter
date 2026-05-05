@@ -1,18 +1,20 @@
 """
-modules/researcher.py
-Researches extracted project names.
+modules/researcher.py — v2.0
 
-v0.7.2 changes:
-  - Tech detection significantly improved — now reads tweet text harder for
-    ZK/FHE/DePIN/restaking signals even when website is unavailable
-  - Website URL enriched from DeFiLlama data when available
-  - Category detection from tweet text (not just website)
-  - GitHub description folded into tech detection
-  - Novel tech now deduplicated properly
-  - research_project() logs what tech was detected and from where
+Stripped down. No DeFiLlama. No CoinGecko trending.
+
+What we actually need to know about a project:
+  1. Does it have a live token? (CoinGecko search — kill signal)
+  2. Is there an active testnet? (GitHub + website scrape)
+  3. Which vertical does it fit? (tech detection)
+  4. Is there a Discord? How big? (scrape if possible)
+  5. Any backing info from tweet context?
+
+That's it. No more 6-hour funding scanner scans.
 """
 import logging
 import time
+import re
 import requests
 from bs4 import BeautifulSoup
 from config.settings import settings
@@ -23,184 +25,72 @@ logger = logging.getLogger(__name__)
 _SESSION = requests.Session()
 _SESSION.headers.update(settings.REQUEST_HEADERS)
 
-_defillama_raises_cache: list = []
-_defillama_cache_time: float = 0
 
-
-def _get(url: str, params: dict = None,
-         retries: int = None,
-         extra_headers: dict = None) -> requests.Response | None:
+def _get(url: str, params: dict = None, retries: int = None) -> requests.Response | None:
     max_retries = retries or settings.MAX_RETRIES
-    headers = {}
-    if extra_headers:
-        headers.update(extra_headers)
-
     for attempt in range(max_retries):
         try:
-            r = _SESSION.get(
-                url, params=params,
-                headers=headers if headers else None,
-                timeout=settings.REQUEST_TIMEOUT,
-            )
+            r = _SESSION.get(url, params=params, timeout=settings.REQUEST_TIMEOUT)
+            if r.status_code == 429:
+                wait = 30 * (attempt + 1)
+                logger.warning("Rate limited on %s — sleeping %ds", url, wait)
+                time.sleep(wait)
+                continue
             r.raise_for_status()
             return r
         except Exception as exc:
             wait = settings.RETRY_BACKOFF_BASE ** attempt
             if attempt < max_retries - 1:
                 time.sleep(wait)
-            else:
-                logger.debug("GET %s failed after %d attempts: %s",
-                             url, max_retries, exc)
     return None
 
 
-def _get_defillama_raises() -> list:
-    global _defillama_raises_cache, _defillama_cache_time
-    age = time.time() - _defillama_cache_time
-    if _defillama_raises_cache and age < settings.DEFILLAMA_CACHE_TTL:
-        return _defillama_raises_cache
-    logger.info("Fetching DeFiLlama raises (one-time cache)...")
-    resp = _get("https://api.llama.fi/raises")
-    if resp is None:
-        return _defillama_raises_cache
-    try:
-        _defillama_raises_cache = resp.json().get("raises", [])
-        _defillama_cache_time = time.time()
-        logger.info("DeFiLlama raises cached: %d records",
-                    len(_defillama_raises_cache))
-    except Exception as exc:
-        logger.error("DeFiLlama raises parse error: %s", exc)
-    return _defillama_raises_cache
-
-
 def check_token_live(project_name: str) -> bool:
+    """Primary: CoinGecko. Returns True if token is live."""
     resp = _get(
         "https://api.coingecko.com/api/v3/search",
         params={"query": project_name},
     )
     if resp is None:
-        return False
+        return False  # Unknown — assume no token, don't block
     try:
         coins = resp.json().get("coins", [])
-        for coin in coins[:3]:
-            coin_name = coin.get("name", "").lower()
-            proj_lower = project_name.lower()
-            if proj_lower == coin_name or proj_lower in coin_name.split():
-                logger.info("Token live: '%s' matches '%s' on CoinGecko",
+        name_lower = project_name.lower().strip()
+        first_word = name_lower.split()[0] if name_lower.split() else name_lower
+        for coin in coins[:5]:
+            cn = coin.get("name", "").lower().strip()
+            rank = coin.get("market_cap_rank")
+            symbol = coin.get("symbol", "").lower()
+            if rank and rank < 2000:
+                if (name_lower in cn or cn in name_lower or
+                        first_word == cn.split()[0] if cn.split() else False or
+                        name_lower == symbol):
+                    logger.info("Token live: '%s' matches '%s' (rank %d)",
+                                project_name, coin.get("name"), rank)
+                    return True
+            if name_lower == cn or name_lower in cn:
+                logger.info("Token live: '%s' matches '%s'",
                             project_name, coin.get("name"))
                 return True
-    except Exception as exc:
-        logger.debug("CoinGecko parse error: %s", exc)
+    except Exception:
+        pass
     return False
 
 
-
-# ── Known project seed data ──────────────────────────────────────────────
-# For well-documented projects where DeFiLlama name doesn't match common name,
-# or where funding is publicly known but not in DeFiLlama.
-# Format: common_name_lower -> {funding_usd, investors, round}
-_KNOWN_PROJECT_DATA = {
-    "zama": {
-        "funding_usd": 73_000_000,
-        "investors": "Paradigm, Protocol Labs, Multicoin Capital",
-        "round": "Series A",
-        "website": "https://www.zama.ai",
-    },
-    "fhenix": {
-        "funding_usd": 22_000_000,
-        "investors": "Multicoin Capital, Collider Ventures, OKX Ventures",
-        "round": "Seed",
-        "website": "https://www.fhenix.io",
-    },
-    "arcium": {
-        "funding_usd": 5_500_000,
-        "investors": "Greenfield Capital, Hashed, Chorus One",
-        "round": "Pre-Seed",
-        "website": "https://arcium.com",
-    },
-    "inco": {
-        "funding_usd": 4_500_000,
-        "investors": "1kx, Consensys Mesh, Fabric Ventures",
-        "round": "Seed",
-        "website": "https://www.inco.org",
-    },
-    "fairblock": {
-        "funding_usd": 1_500_000,
-        "investors": "NGC Ventures, Lemniscap",
-        "round": "Pre-Seed",
-        "website": "https://fairblock.network",
-    },
-    "miden": {
-        "funding_usd": 25_000_000,
-        "investors": "a16z crypto, 1kx, Hack VC, Finality Capital Partners",
-        "round": "Series A",
-        "website": "https://polygon.technology/polygon-miden",
-    },
-    "boundless": {
-        "funding_usd": 20_000_000,
-        "investors": "Blockchain Capital, Multicoin Capital",
-        "round": "Series A",
-        "website": "https://risczero.com",
-    },
-}
-
-def search_defillama_raises(project_name: str) -> dict:
-    """
-    v0.9.6: Improved fuzzy matching.
-    Previous logic split on spaces which missed many entries.
-    Now tries multiple match strategies in priority order.
-    """
-    raises = _get_defillama_raises()
-    name_lower = project_name.lower().strip()
-
-    exact = None        # exact name match
-    starts = None       # raise name starts with project name
-    contains = None     # project name contained in raise name
-    reverse = None      # raise name contained in project name
-
-    for r in raises:
-        rn = str(r.get("name", "")).lower().strip()
-        if not rn:
-            continue
-        if rn == name_lower:
-            exact = r
-            break
-        if rn.startswith(name_lower) and starts is None:
-            starts = r
-        if name_lower in rn and contains is None:
-            contains = r
-        if len(name_lower) >= 4 and rn in name_lower and reverse is None:
-            reverse = r
-
-    best = exact or starts or contains or reverse
-    if not best:
-        return {}
-    amount = best.get("amount", 0) or 0
-    return {
-        "funding_usd": float(amount) * 1_000_000,
-        "investors": ", ".join(
-            best.get("leadInvestors", []) + best.get("otherInvestors", [])
-        ),
-        "round": best.get("round", ""),
-        "date": best.get("date", ""),
-        "website": best.get("url", ""),
-    }
-
-
 def search_github(project_name: str) -> dict:
-    """Search GitHub. v0.7.2: auth headers actually passed (was bug)."""
-    github_headers = {}
+    """Search GitHub for project repos."""
+    headers = {}
     if settings.GITHUB_TOKEN:
-        github_headers["Authorization"] = f"token {settings.GITHUB_TOKEN}"
-        github_headers["Accept"] = "application/vnd.github.v3+json"
+        headers["Authorization"] = f"token {settings.GITHUB_TOKEN}"
+        headers["Accept"] = "application/vnd.github.v3+json"
 
     resp = _get(
         "https://api.github.com/search/repositories",
         params={"q": project_name, "sort": "stars", "per_page": 5},
-        extra_headers=github_headers if github_headers else None,
     )
     if resp is None:
         return {}
+
     try:
         items = resp.json().get("items", [])
         if items:
@@ -213,13 +103,33 @@ def search_github(project_name: str) -> dict:
                     days_old = (datetime.now(timezone.utc) - dt).days
                 except Exception:
                     days_old = 999
-                recency_bonus = max(0, 180 - days_old) / 180
-                return stars * (0.7 + 0.3 * recency_bonus)
+                return stars * max(0, 1 - days_old / 365)
+
             best = max(items, key=_rank)
+            updated = best.get("updated_at", "")
+            days_since = 999
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                days_since = (datetime.now(timezone.utc) - dt).days
+            except Exception:
+                pass
+
+            # Calculate project age
+            created = best.get("created_at", "")
+            age_days = 999
+            try:
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                age_days = (datetime.now(timezone.utc) - dt).days
+            except Exception:
+                pass
+
             return {
                 "github_url": best.get("html_url", ""),
                 "stars": best.get("stargazers_count", 0),
-                "last_commit": best.get("updated_at", ""),
+                "last_commit": updated,
+                "days_since_commit": days_since,
+                "age_days": age_days,
                 "description": best.get("description", "") or "",
                 "topics": best.get("topics", []),
             }
@@ -228,130 +138,76 @@ def search_github(project_name: str) -> dict:
     return {}
 
 
-def scrape_project_website(website: str) -> str:
-    if not website:
-        return ""
-    resp = _get(website)
+def scrape_website(url: str) -> dict:
+    """Scrape project website for testnet/discord signals."""
+    if not url:
+        return {}
+
+    resp = _get(url)
     if resp is None:
-        return ""
+        return {}
+
+    result = {
+        "testnet_mentioned": False,
+        "discord_url": None,
+        "discord_size_estimate": None,
+        "galxe_mentioned": False,
+    }
+
     try:
         raw = resp.content[:settings.MAX_SCRAPE_BYTES]
         soup = BeautifulSoup(raw, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer",
-                          "aside", "head", "meta", "noscript",
-                          "iframe", "svg", "img"]):
-            tag.decompose()
-        return " ".join(soup.get_text(separator=" ").split())[:3000]
+        text = soup.get_text(separator=" ").lower()
+
+        # Testnet signals
+        if any(s in text for s in ["testnet", "devnet", "public testnet",
+                                    "testnet is live", "join testnet"]):
+            result["testnet_mentioned"] = True
+
+        # Discord link
+        discord_links = re.findall(r'discord\.gg/[\w-]+|discord\.com/invite/[\w-]+', text)
+        if discord_links:
+            result["discord_url"] = discord_links[0]
+
+        # Galxe presence
+        if "galxe" in text or "galaxy.eco" in text:
+            result["galxe_mentioned"] = True
+
     except Exception:
-        return ""
+        pass
+
+    return result
 
 
-# ── Tech detection (v0.7.2 — significantly expanded) ──────────────────────
-
-# High-value signals mapped to canonical category names
-_TECH_SIGNAL_MAP = {
-    # ZK / Privacy
-    "fhe": "fhe", "fully homomorphic": "fhe",
-    "zero knowledge": "zero knowledge", "zk proof": "zero knowledge",
-    "zkvm": "zero knowledge", "zkp": "zero knowledge",
-    "zk rollup": "zero knowledge", "zk-rollup": "zero knowledge",
-    "zk-evm": "zero knowledge", "zkevm": "zero knowledge",
-    "privacy": "privacy", "mpc": "privacy",
-    # DePIN
-    "depin": "depin", "decentralized physical": "depin",
-    "wireless": "depin", "iot": "depin", "hardware": "depin",
-    "node operator": "depin", "validator": "depin",
-    # AI / ML
-    "ai blockchain": "ai blockchain", "on-chain ai": "ai blockchain",
-    "autonomous agent": "ai blockchain", "ai agent": "ai blockchain",
-    "machine learning": "ai blockchain", "inference": "ai blockchain",
-    # Restaking / Shared security
-    "restaking": "restaking", "shared security": "restaking",
-    "avs": "restaking", "eigenlayer": "restaking",
-    # Modular / DA
-    "modular": "modular", "data availability": "modular",
-    "rollup": "modular",
-    # Intent / AA
-    "intent based": "intent based", "account abstraction": "account abstraction",
-    "aa wallet": "account abstraction",
-    # Social graph
-    "social graph": "social graph", "ai social": "social graph",
-    "on-chain identity": "identity",
-    # RWA
-    "real world asset": "rwa", "rwa": "rwa", "tokenized": "rwa",
-    # Payments
-    "payments": "payments", "stablecoin": "payments",
-    # Layer 1 / Layer 2
-    "layer 1": "layer 1", "l1 blockchain": "layer 1",
-    "layer 2": "layer 2", "l2": "layer 2",
-}
-
-
-def _detect_novel_tech(text: str) -> list[str]:
-    """
-    v0.7.2: Uses _TECH_SIGNAL_MAP for canonical dedup.
-    Returns list of canonical tech category strings.
-    """
-    found = {}
+def _detect_vertical_from_text(text: str) -> str:
     lower = text.lower()
-    for signal, canonical in _TECH_SIGNAL_MAP.items():
-        if signal in lower and canonical not in found:
-            found[canonical] = True
-    # Also check settings.NOVEL_TECH_SIGNALS for any not in map
-    for signal in settings.NOVEL_TECH_SIGNALS:
-        if signal in lower and signal not in found:
-            found[signal] = True
-    return list(found.keys())
-
-
-def _detect_testnet(text: str) -> bool:
-    signals = ["testnet", "devnet", "join our network", "run a node",
-                "validator", "node operator", "public testnet",
-                "incentivized testnet", "testnet is live", "testnet launch"]
-    lower = text.lower()
-    return any(s in lower for s in signals)
-
-
-def _detect_category(text: str) -> str:
-    """Infer project category from combined text signals."""
-    lower = text.lower()
-    if any(x in lower for x in ["fhe", "fully homomorphic"]):
-        return "FHE"
-    if any(x in lower for x in ["zero knowledge", "zkvm", "zkp", "zk proof", "zkevm"]):
-        return "ZK/Privacy"
-    if any(x in lower for x in ["depin", "decentralized physical", "iot", "hardware node"]):
-        return "DePIN"
-    if any(x in lower for x in ["restaking", "shared security", "avs"]):
-        return "Restaking"
-    if any(x in lower for x in ["modular", "data availability"]):
-        return "Modular"
-    if any(x in lower for x in ["ai agent", "on-chain ai", "ai blockchain", "inference"]):
-        return "AI/ML"
-    if any(x in lower for x in ["layer 1", "l1 blockchain"]):
-        return "Layer 1"
-    if any(x in lower for x in ["layer 2", "l2", "rollup"]):
-        return "Layer 2"
-    if any(x in lower for x in ["rwa", "real world asset", "tokenized"]):
-        return "RWA"
-    if any(x in lower for x in ["payments", "stablecoin", "remittance"]):
-        return "Payments"
-    if any(x in lower for x in ["gaming", "game", "nft"]):
-        return "Gaming"
-    return "Infrastructure"
+    if any(x in lower for x in ["fhe", "zero knowledge", "zk ", "zkvm",
+                                  "zk proof", "rollup", "starknet", "l2 "]):
+        return "zk_l2"
+    if any(x in lower for x in ["perp", "perpetual", "hyperliquid",
+                                  "trading competition", "vault"]):
+        return "perpdex"
+    if any(x in lower for x in ["solana", "jito", "meteora", "jupiter"]):
+        return "solana_defi"
+    if any(x in lower for x in ["cosmos", "ibc", "celestia", "da layer",
+                                  "data availability", "staking"]):
+        return "cosmos_da"
+    return "infrastructure"
 
 
 def research_project(project_name: str, tweet_text: str = "") -> dict:
     """
-    Full research pipeline.
-    v0.7.2: Tech detection now runs on tweet + GitHub + website combined.
-    Category inferred from all available text. Website enriched from DeFiLlama.
+    v2.0: Focused research pipeline.
+    No DeFiLlama. No CoinGecko trending.
+    Goal: answer the 5 questions that matter for farming.
     """
     cached = db.get_research_cache(project_name)
     if cached:
-        logger.debug("DB research cache hit: %s", project_name)
+        logger.debug("Cache hit: %s", project_name)
         return cached
 
     logger.info("Researching: %s", project_name)
+
     result = {
         "name": project_name,
         "funding_usd": 0,
@@ -362,75 +218,97 @@ def research_project(project_name: str, tweet_text: str = "") -> dict:
         "github": "",
         "description": "",
         "novel_tech": [],
-        "category": "Infrastructure",
+        "category": "infrastructure",
+        "vertical": "infrastructure",
+        "discord_size": None,
+        "has_galxe": False,
+        "github_days_since_commit": 999,
+        "project_age_days": 999,
         "research_notes": [],
     }
 
-    # Token check first
+    # 1. Token check — kill signal
+    time.sleep(1)
     result["has_token"] = check_token_live(project_name)
     if result["has_token"]:
-        result["research_notes"].append("⚠️ Token already live on CoinGecko")
+        result["research_notes"].append("⛔ Token already live")
         db.set_research_cache(project_name, result)
         return result
 
-    time.sleep(1)
-
-    # DeFiLlama — also enriches website URL
-    funding_data = search_defillama_raises(project_name)
-    if not funding_data:
-        # Fall back to known project seed data
-        funding_data = _KNOWN_PROJECT_DATA.get(project_name.lower().strip(), {})
-        if funding_data:
-            result["research_notes"].append("📚 Known project data (verified)")
-    if funding_data:
-        result.update(funding_data)
-        result["research_notes"].append(
-            f"💰 Funding: ${funding_data.get('funding_usd', 0)/1e6:.1f}M raised"
-            + (f" ({funding_data.get('round', '')})" if funding_data.get('round') else "")
-        )
-
-    # GitHub — fold description + topics into tech detection
+    # 2. GitHub
     gh = search_github(project_name)
-    gh_text = ""
     if gh:
         result["github"] = gh.get("github_url", "")
+        result["github_days_since_commit"] = gh.get("days_since_commit", 999)
+        result["project_age_days"] = gh.get("age_days", 999)
+        result["description"] = gh.get("description", "")
+
         gh_text = gh.get("description", "") + " " + " ".join(gh.get("topics", []))
         result["research_notes"].append(
             f"⚙️ GitHub: {gh.get('stars', 0)}★ "
-            f"updated {gh.get('last_commit','')[:10]}"
+            f"({gh.get('days_since_commit', 999)}d ago)"
         )
 
-    # Website scrape
-    page_text = ""
-    if result.get("website"):
-        page_text = scrape_project_website(result["website"])
-        if page_text:
-            result["research_notes"].append("🌐 Website scraped")
-        if _detect_testnet(page_text):
+        # Testnet from GitHub
+        testnet_words = ["testnet", "devnet", "validator", "node", "prover"]
+        if any(w in gh_text.lower() for w in testnet_words):
             result["testnet_active"] = True
-            result["research_notes"].append("🧪 Testnet detected on website")
+            result["research_notes"].append("🧪 Testnet signal in GitHub")
 
-    # Combined tech detection — tweet + github + website (v0.7.2)
-    combined = f"{tweet_text} {gh_text} {page_text}"
-    novel = _detect_novel_tech(combined)
-    result["novel_tech"] = novel
+    # 3. Detect vertical from all available text
+    combined = f"{tweet_text} {result['description']}"
+    result["vertical"] = _detect_vertical_from_text(combined)
 
-    # Testnet detection from any source
-    if _detect_testnet(tweet_text) or _detect_testnet(gh_text):
-        result["testnet_active"] = True
-        if not any("Testnet" in n for n in result["research_notes"]):
-            result["research_notes"].append("🧪 Testnet signal in tweet/GitHub")
+    # 4. Testnet from tweet text
+    if not result["testnet_active"]:
+        testnet_words = ["testnet", "devnet", "testnet is live", "join testnet",
+                         "testnet launch", "public testnet", "incentivized testnet"]
+        if any(w in tweet_text.lower() for w in testnet_words):
+            result["testnet_active"] = True
+            result["research_notes"].append("🧪 Testnet signal in tweet")
 
-    # Category from all available text
-    result["category"] = _detect_category(combined)
+    # 5. Extract funding/investors from tweet context
+    investors_from_tweet = _extract_investors_from_tweet(tweet_text)
+    if investors_from_tweet:
+        result["investors"] = investors_from_tweet
+        result["research_notes"].append(f"💰 Backing: {investors_from_tweet[:60]}")
 
-    if novel:
-        result["research_notes"].append(f"🔬 Tech: {', '.join(novel)}")
-        logger.info("'%s' tech detected: %s", project_name, novel)
-
-    # Use GitHub description if no other description
-    if not result.get("description") and gh_text.strip():
-        result["description"] = gh_text.strip()[:300]
+    funding_from_tweet = _extract_funding_from_tweet(tweet_text)
+    if funding_from_tweet:
+        result["funding_usd"] = funding_from_tweet
+        result["research_notes"].append(
+            f"💰 Funding: ${funding_from_tweet/1e6:.1f}M (from tweet)"
+        )
 
     db.set_research_cache(project_name, result)
     return result
+
+
+def _extract_investors_from_tweet(tweet_text: str) -> str:
+    """Extract VC/investor names mentioned in the tweet."""
+    known_funds = [
+        "a16z", "andreessen horowitz", "paradigm", "multicoin",
+        "polychain", "electric capital", "dragonfly", "pantera",
+        "binance labs", "coinbase ventures", "sequoia", "1kx",
+        "hack vc", "framework ventures", "spartan", "delphi",
+        "jump crypto", "solana ventures",
+    ]
+    lower = tweet_text.lower()
+    found = [f for f in known_funds if f in lower]
+    return ", ".join(found) if found else ""
+
+
+def _extract_funding_from_tweet(tweet_text: str) -> float:
+    """Extract funding amount from tweet text."""
+    patterns = [
+        r'\$(\d+(?:\.\d+)?)\s*[Mm](?:illion)?',
+        r'(\d+(?:\.\d+)?)\s*[Mm](?:illion)?\s*(?:USD|USDC)?',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, tweet_text, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1)) * 1_000_000
+            except Exception:
+                pass
+    return 0
